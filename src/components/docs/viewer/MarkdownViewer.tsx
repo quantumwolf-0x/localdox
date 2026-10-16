@@ -20,6 +20,8 @@ import { createPortal } from "react-dom";
 import { ProgressiveMarkdown } from "./markdown-viewer/ProgressiveMarkdown";
 import { markdownComponents } from "./markdown-viewer/markdown-components";
 import { useSectionFolds } from "./markdown-viewer/section-folds";
+import { MarkdownViewModes, type MarkdownViewMode } from "./markdown-viewer/MarkdownViewModes";
+import { MarkdownOutline } from "./markdown-viewer/MarkdownOutline";
 import { MathProvider } from "@/services/math/MathContext";
 import { DEFAULT_MATH_PREFERENCES } from "@/services/math/types";
 import { slugLabel } from "@/services/math/equation-registry";
@@ -274,7 +276,15 @@ function MarkdownViewerImpl({
   onToggleNotes,
   notesOpen = false,
 }: Props) {
-  const singleMode = readingMode === "single";
+  const [view, setView] = useState<{ fileId: string; mode: MarkdownViewMode }>(() => ({
+    fileId: file.id,
+    mode: "preview",
+  }));
+  const viewMode = view.fileId === file.id ? view.mode : "preview";
+  const wrapAll = viewMode === "wrapped";
+  // Wrapped mode is a view of every section in this file, even when ordinary
+  // preview reads one page at a time. The reader's preference stays intact.
+  const singleMode = readingMode === "single" || wrapAll;
   const containerRef = useRef<HTMLDivElement>(null);
   const [editMode, setEditMode] = useState(false);
   // The draft text itself lives inside <MarkdownEditor>. Only the source the
@@ -584,6 +594,7 @@ function MarkdownViewerImpl({
   // Sections the reader has wrapped up, by heading id. Cleared on a document
   // switch: the ids belong to the document that was open.
   const [collapsedSections, setCollapsedSections] = useState<Set<string>>(() => new Set());
+  const [expandedSections, setExpandedSections] = useState<Set<string>>(() => new Set());
   // Reset during render, on an actual switch only. An effect keyed on `file.id`
   // also ran on mount, after the first commit: a fold made while a long
   // document was still mounting could land before that effect flushed, and the
@@ -592,22 +603,40 @@ function MarkdownViewerImpl({
   if (foldsFileId !== file.id) {
     setFoldsFileId(file.id);
     setCollapsedSections(new Set());
+    setExpandedSections(new Set());
+    setView({ fileId: file.id, mode: "preview" });
   }
 
   const collapseCtx = useMemo<CollapseContextValue>(
     () => ({
-      isCollapsed: (headingId) => collapsedSections.has(headingId),
+      isCollapsed: (headingId) =>
+        wrapAll ? !expandedSections.has(headingId) : collapsedSections.has(headingId),
+      showControls: wrapAll,
       toggle: (headingId) =>
-        setCollapsedSections((previous) => {
+        (wrapAll ? setExpandedSections : setCollapsedSections)((previous) => {
           const next = new Set(previous);
           if (next.has(headingId)) next.delete(headingId);
           else next.add(headingId);
           return next;
         }),
     }),
-    [collapsedSections],
+    [collapsedSections, expandedSections, wrapAll],
   );
-  useSectionFolds(contentRef, collapsedSections, `${contentKey}:${editMode}`);
+  useSectionFolds(
+    contentRef,
+    collapsedSections,
+    `${contentKey}:${editMode}`,
+    wrapAll ? expandedSections : undefined,
+  );
+
+  const changeViewMode = (mode: MarkdownViewMode) => {
+    setView({ fileId: file.id, mode });
+    setCollapsedSections(new Set());
+    setExpandedSections(new Set());
+    setMenu(null);
+    window.getSelection()?.removeAllRanges();
+    scrollToTop();
+  };
 
   // Opening a passage from a note's source link: once the target page is rendered,
   // scroll to the passage and flash it. Anchored by quote first (the document
@@ -1441,7 +1470,7 @@ function MarkdownViewerImpl({
                   <NotebookPen className="h-4 w-4" />
                 </button>
               )}
-              {onToggleReadingMode && (
+              {onToggleReadingMode && viewMode === "preview" && (
                 <button
                   onClick={onToggleReadingMode}
                   title={
@@ -1459,6 +1488,7 @@ function MarkdownViewerImpl({
           ) : undefined
         }
       />
+      {!editMode && <MarkdownViewModes mode={viewMode} onChange={changeViewMode} />}
       <div
         ref={containerRef}
         className="relative flex-1 overflow-y-auto transition-colors duration-500"
@@ -1698,7 +1728,20 @@ function MarkdownViewerImpl({
           // already-narrow screen would be unreadable.
           style={{ "--docs-content-width": `${contentWidth}cqi` } as CSSProperties}
         >
+          {!editMode && viewMode === "tree" && (
+            <MarkdownOutline
+              source={file.content}
+              fileId={file.id}
+              fileName={file.name}
+              onOpen={(headingId) => {
+                changeViewMode("preview");
+                onNav(file.id, headingId);
+                setPendingHeading(headingId);
+              }}
+            />
+          )}
           <article
+            hidden={!editMode && viewMode === "tree"}
             onMouseUp={() => openCreateMenu()}
             onContextMenu={onContextMenu}
             className="docs-prose mx-auto min-w-0 flex-1"
@@ -1837,7 +1880,7 @@ function MarkdownViewerImpl({
           containerRef={containerRef}
           contentRef={contentRef}
           revision={markdownSource}
-          hidden={editMode}
+          hidden={editMode || viewMode === "tree"}
         />
       </div>
     </div>
