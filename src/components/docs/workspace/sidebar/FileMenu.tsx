@@ -8,6 +8,7 @@ import {
   MoreVertical,
   Pencil,
   Share2,
+  Settings2,
   SquarePen,
   Trash2,
   Upload,
@@ -34,6 +35,7 @@ export function FileMenu({
   onDownload,
   formats = ["original"],
   onShare,
+  onConfigure,
 }: {
   /** Show this document in a column of its own, beside what is being read. */
   onAddToSplit?: () => void;
@@ -74,6 +76,7 @@ export function FileMenu({
   onDownload?: (format: ExportFormat) => void;
   formats?: ExportFormat[];
   onShare?: () => void;
+  onConfigure?: () => void;
 }) {
   const [open, setOpen] = useState(false);
   // Which flyout is open beside the menu, and the row it hangs off.
@@ -133,6 +136,17 @@ export function FileMenu({
       {open && (
         <MenuPanel>
           {/* Working on the document itself. */}
+          {onConfigure && (
+            <MenuItem
+              icon={Settings2}
+              label="Configure"
+              onClick={(e) => {
+                e.stopPropagation();
+                setOpen(false);
+                onConfigure();
+              }}
+            />
+          )}
           {onEdit && (
             <MenuItem
               icon={SquarePen}

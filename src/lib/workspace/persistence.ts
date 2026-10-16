@@ -1,4 +1,3 @@
-import type { WorkspaceKind } from "./kinds";
 import { sameData, migrateData, migrateFileData, portableFiles } from "./binary.ts";
 import type { FileData } from "./binary.ts";
 // Local-first persistence, Excalidraw-style. No backend.
@@ -115,7 +114,6 @@ import type { Note } from "./notes";
 import type { Scratchpad } from "./rough-work";
 
 export interface WorkspaceRecord {
-  kind?: WorkspaceKind;
   /**
    * Storage revision this snapshot was read at (or last written as). A write
    * without one creates the workspace and fails if it already exists; a write
@@ -178,7 +176,7 @@ export class WorkspaceConflictError extends Error {
 }
 
 const DB_NAME = "localdox";
-const DB_VERSION = 4;
+const DB_VERSION = 5;
 const STORE = "workspaces";
 const FILES = "files";
 const SUMMARIES = "workspace-summaries";
@@ -188,7 +186,6 @@ const SUMMARIES = "workspace-summaries";
 const SPLIT_BODIES = "file-bodies";
 
 export interface WorkspaceSummary {
-  kind?: WorkspaceKind;
   id: string;
   name: string;
   createdAt: number;
@@ -210,14 +207,22 @@ export type FileEntry = Omit<PersistedFile, "data">;
 /** A workspace read without binary bodies (`persistence.getWorkspaceEntries`). */
 export type WorkspaceEntries = Omit<WorkspaceRecord, "files"> & { files: FileEntry[] };
 
-/** Summary totals are recomputed lazily, from Blob sizes (`storedBytesByWorkspace`). */
-function forgetSummaryTotals(summaries: IDBObjectStore) {
-  const cursor = summaries.openCursor();
+/** Ignore the removed workspace type in old snapshots and backups. */
+function withoutWorkspaceType<T extends object>(record: T): T {
+  const clean = { ...record };
+  delete (clean as T & { kind?: unknown }).kind;
+  return clean;
+}
+
+/** Remove old workspace types without reading or rewriting document bodies. */
+function migrateWorkspaceMetadata(store: IDBObjectStore, forgetBytes = false) {
+  const cursor = store.openCursor();
   cursor.onsuccess = () => {
     const row = cursor.result;
     if (!row) return;
-    const { bytes: _bytes, ...summary } = row.value as WorkspaceSummary;
-    row.update(summary);
+    const record = withoutWorkspaceType(row.value);
+    if (forgetBytes) delete record.bytes;
+    row.update(record);
     row.continue();
   };
 }
@@ -226,7 +231,6 @@ function summaryOf(w: WorkspaceRecord, bytes: number): WorkspaceSummary {
   return {
     id: w.id,
     name: w.name,
-    kind: w.kind ?? "reader",
     createdAt: w.createdAt,
     updatedAt: w.updatedAt,
     docCount: w.files.length,
@@ -313,6 +317,9 @@ function openDb(): Promise<IDBDatabase> {
         return;
       }
       const db = req.result;
+      const resetSummaryBytes =
+        event.oldVersion === 2 ||
+        (event.oldVersion === 3 && db.objectStoreNames.contains(SPLIT_BODIES));
       if (!db.objectStoreNames.contains(STORE)) {
         db.createObjectStore(STORE, { keyPath: "id" });
       }
@@ -326,7 +333,7 @@ function openDb(): Promise<IDBDatabase> {
         cursor.onsuccess = () => {
           const row = cursor.result;
           if (!row) return;
-          const workspace = row.value as WorkspaceRecord;
+          const workspace = withoutWorkspaceType(row.value as WorkspaceRecord);
           const migrated = workspace.files.map(migrateFileData);
           for (const file of migrated) files.put({ ...file, workspaceId: workspace.id });
           const { files: documents, ...metadata } = workspace;
@@ -351,7 +358,6 @@ function openDb(): Promise<IDBDatabase> {
           if (data !== file.data) row.update({ ...file, data });
           row.continue();
         };
-        forgetSummaryTotals(tx.objectStore(SUMMARIES));
       } else if (event.oldVersion === 3 && db.objectStoreNames.contains(SPLIT_BODIES)) {
         // The interim v3: move each body back into its row, one at a time, as
         // a Blob, then drop the store. Same atomicity as above.
@@ -371,7 +377,11 @@ function openDb(): Promise<IDBDatabase> {
           };
           body.continue();
         };
-        forgetSummaryTotals(tx.objectStore(SUMMARIES));
+      }
+      if (event.oldVersion >= 2) {
+        migrateWorkspaceMetadata(req.transaction!.objectStore(STORE));
+        // Older binary migrations invalidate totals; v4 totals remain valid.
+        migrateWorkspaceMetadata(req.transaction!.objectStore(SUMMARIES), resetSummaryBytes);
       }
     };
     req.onsuccess = () => {
@@ -533,7 +543,10 @@ export const persistence = {
   async putWorkspaces(records: WorkspaceRecord[]): Promise<string[]> {
     // Snapshot before awaiting; callers may keep editing their objects.
     const originalData = records.map((w) => new Map(w.files.map((file) => [file.id, file.data])));
-    const snapshots = records.map((w) => ({ ...w, files: w.files.map(migrateFileData) }));
+    const snapshots = records.map((w) => ({
+      ...withoutWorkspaceType(w),
+      files: w.files.map(migrateFileData),
+    }));
     if (new Set(snapshots.map((w) => w.id)).size !== snapshots.length)
       throw new Error("A workspace can only be written once per transaction");
     const db = await openDb();
@@ -798,12 +811,11 @@ export function emptyUI(): PersistedUI {
   };
 }
 
-export function newWorkspaceRecord(name: string, kind: WorkspaceKind = "reader"): WorkspaceRecord {
+export function newWorkspaceRecord(name: string): WorkspaceRecord {
   const now = Date.now();
   return {
     id: crypto.randomUUID(),
     name,
-    kind,
     createdAt: now,
     updatedAt: now,
     files: [],
@@ -1018,7 +1030,7 @@ export const BACKUP_VERSION = 2;
 
 /** A complete, faithful backup — Bin, stars, notes and layout included. */
 export async function serializeWorkspace(w: WorkspaceRecord): Promise<string> {
-  const { revision: _revision, ...workspace } = w;
+  const { revision: _revision, ...workspace } = withoutWorkspaceType(w);
   return JSON.stringify(
     {
       format: "localdox-workspace",
@@ -1057,7 +1069,6 @@ export function parseWorkspaceImport(json: string): WorkspaceRecord {
   return {
     id: w.id ?? crypto.randomUUID(),
     name: w.name,
-    kind: w.kind ?? "reader",
     createdAt: w.createdAt ?? now,
     updatedAt: now,
     files: w.files.map((file) => {

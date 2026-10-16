@@ -15,6 +15,12 @@ import {
   FolderOpen,
   CheckSquare,
   X,
+  Plus,
+  FilePlus,
+  FolderPlus,
+  PenTool,
+  FileQuestion,
+  FileCog,
 } from "lucide-react";
 import {
   ContextMenu,
@@ -23,6 +29,9 @@ import {
   ContextMenuSeparator,
   ContextMenuShortcut,
   ContextMenuTrigger,
+  ContextMenuSub,
+  ContextMenuSubTrigger,
+  ContextMenuSubContent,
 } from "@/components/ui/context-menu";
 import { modKeyLabel } from "@/lib/platform/keyboard";
 import type { Highlight } from "@/lib/markdown/dom-highlighter";
@@ -128,6 +137,7 @@ interface Props {
   onRenameFile: (id: string, newName: string) => void;
   /** Open a document in the editor. Only offered for editable text documents. */
   onEditFile?: (id: string) => void;
+  onConfigureExam?: (id: string) => void;
   onConvertFile?: (id: string) => void;
   convertingFileId?: string | null;
   /**
@@ -141,7 +151,8 @@ interface Props {
   onCreateMermaid?: (folderId?: string | null) => void;
   onCreateBoard?: (folderId?: string | null) => void;
   /** Open the New exam dialog: an `.xam` paper tagged with a ruleset. */
-  onCreateExam?: () => void;
+  onCreateExam?: (folderId?: string | null) => void;
+  onCreateRules?: () => void;
   /** A new `.xp` practice file, named first like any new file. */
   onCreatePractice?: (folderId?: string | null) => void;
   /** Create a folder, optionally nested inside an existing one. */
@@ -216,6 +227,7 @@ function SidebarImpl({
   onRemoveSelection,
   onRenameFile,
   onEditFile,
+  onConfigureExam,
   onConvertFile,
   convertingFileId,
   folders: allFolders = [],
@@ -223,6 +235,7 @@ function SidebarImpl({
   onCreateMermaid,
   onCreateBoard,
   onCreateExam,
+  onCreateRules,
   onCreatePractice,
   onCreateFolder,
   onRenameFolder,
@@ -978,6 +991,9 @@ function SidebarImpl({
           </button>
           {!selecting ? (
             <FileMenu
+              onConfigure={
+                kind === "exam" && onConfigureExam ? () => onConfigureExam(file.id) : undefined
+              }
               // The file types with an editor behind them. A PDF or a
               // spreadsheet has no edit mode to enter, so the item is absent
               // rather than present and inert.
@@ -1126,6 +1142,7 @@ function SidebarImpl({
             onCreateBoard={onCreateBoard ? () => onCreateBoard(null) : undefined}
             onCreateFolder={onCreateFolder ? promptNewFolder : undefined}
             onCreateExam={onCreateExam}
+            onCreateRules={onCreateRules}
             onCreatePractice={onCreatePractice ? () => onCreatePractice(null) : undefined}
             onUpload={onAddFiles}
           />
@@ -1226,6 +1243,79 @@ function SidebarImpl({
             </nav>
           </ContextMenuTrigger>
           <ContextMenuContent className="z-(--z-menu) w-56 rounded-xl p-1.5 shadow-xl">
+            <ContextMenuSub>
+              <ContextMenuSubTrigger className={CONTEXT_ITEM}>
+                <Plus className="h-4 w-4" />
+                New
+              </ContextMenuSubTrigger>
+              <ContextMenuSubContent className="z-(--z-menu) w-48 rounded-xl p-1.5">
+                <ContextMenuItem
+                  className={CONTEXT_ITEM}
+                  disabled={!onCreateFile}
+                  onSelect={() =>
+                    onCreateFile?.(
+                      contextRowRef.current?.folderId ??
+                        files.find((f) => f.id === contextRowRef.current?.fileId)?.folderId ??
+                        null,
+                    )
+                  }
+                >
+                  <FilePlus className="h-4 w-4" />
+                  File
+                </ContextMenuItem>
+                <ContextMenuItem
+                  className={CONTEXT_ITEM}
+                  disabled={!onCreateFolder}
+                  onSelect={() =>
+                    promptNewFolder(
+                      contextRowRef.current?.folderId ??
+                        files.find((f) => f.id === contextRowRef.current?.fileId)?.folderId ??
+                        null,
+                    )
+                  }
+                >
+                  <FolderPlus className="h-4 w-4" />
+                  Folder
+                </ContextMenuItem>
+                <ContextMenuItem
+                  className={CONTEXT_ITEM}
+                  disabled={!onCreateBoard}
+                  onSelect={() =>
+                    onCreateBoard?.(
+                      contextRowRef.current?.folderId ??
+                        files.find((f) => f.id === contextRowRef.current?.fileId)?.folderId ??
+                        null,
+                    )
+                  }
+                >
+                  <PenTool className="h-4 w-4" />
+                  Board
+                </ContextMenuItem>
+                <ContextMenuItem
+                  className={CONTEXT_ITEM}
+                  disabled={!onCreateExam}
+                  onSelect={() =>
+                    onCreateExam?.(
+                      contextRowRef.current?.folderId ??
+                        files.find((f) => f.id === contextRowRef.current?.fileId)?.folderId ??
+                        null,
+                    )
+                  }
+                >
+                  <FileQuestion className="h-4 w-4" />
+                  Exam
+                </ContextMenuItem>
+                <ContextMenuItem
+                  className={CONTEXT_ITEM}
+                  disabled={!onCreateRules}
+                  onSelect={onCreateRules}
+                >
+                  <FileCog className="h-4 w-4" />
+                  Ruleset
+                </ContextMenuItem>
+              </ContextMenuSubContent>
+            </ContextMenuSub>
+            <ContextMenuSeparator />
             {selecting ? (
               <>
                 <ContextMenuItem

@@ -1,18 +1,14 @@
-import { LEGACY_EXAM_WORKSPACE, workspaceKind, type WorkspaceKind } from "@/lib/workspace/kinds";
+import { readAppRoute, settingsPath, workspacePath } from "@/lib/app/routes";
+import { LEGACY_EXAM_WORKSPACE } from "@/services/exams/legacy-workspace";
 import { dataBytes } from "@/lib/workspace/binary";
 import { ConversionContext } from "@/services/doc-conversion/ConversionContext";
 import { ensureEmbedMediaFolder } from "@/lib/workspace/embed-media";
 import type { DocumentUpdate } from "@/services/office-editing";
 import { Fragment, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useLocation, useNavigate } from "@tanstack/react-router";
+import { useBlocker, useLocation, useNavigate } from "@tanstack/react-router";
 import { PanelLeft, X, Search, Undo2, Settings, Folder } from "lucide-react";
 
-import {
-  ESCAPE_DEPTH,
-  NavHistoryContext,
-  useNavHistoryState,
-  type NavEntry,
-} from "@/hooks/use-nav-history";
+import { ESCAPE_DEPTH, NavHistoryContext, useNavHistoryState } from "@/hooks/use-nav-history";
 import {
   Sidebar,
   AddMenu,
@@ -113,16 +109,12 @@ const DocumentViewer = lazy(() =>
  */
 const MAX_PANES = 4;
 
+const ExamConfigureDialog = lazy(() => import("./workspace/ExamConfigureDialog"));
+
 const SettingsPage = lazy(() =>
   import("./pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
 );
 
-/** The settings section a caller asked for, handed over the route change that
- *  opens the dialog. DocsApp is the route component, so it remounts on the way
- *  to /settings and nothing held inside it survives to be read at mount. */
-let pendingSettingsTab: "workspace" | "exams" | undefined;
-/** The ruleset Settings ▸ Exam rules should open on, when a paper asked to edit its rules. */
-let pendingSettingsRules: string | undefined;
 let pendingSettingsFocus = false;
 const AskAiPanel = lazy(() =>
   import("@/services/ai/AskAiPanel").then((m) => ({ default: m.AskAiPanel })),
@@ -310,7 +302,7 @@ function importSharedWorkspaceOnce(key: string): Promise<WorkspaceRecord> {
   return pending;
 }
 
-export function DocsApp({ initialExamWorkspace = false }: { initialExamWorkspace?: boolean }) {
+export function DocsApp() {
   const [files, setFiles] = useState<MdFile[]>([]);
   const officeDirtyPanes = useRef(new Set<string>());
   // Sidebar folders. Flat buckets over the file list — a file's `folderId` says
@@ -572,20 +564,20 @@ export function DocsApp({ initialExamWorkspace = false }: { initialExamWorkspace
   // Home page + personalization.
   const location = useLocation();
   const navigate = useNavigate();
-  const showSettings = location.pathname === "/settings";
+  const appRoute = readAppRoute(location.pathname);
+  const showSettings = appRoute.settings;
   const mountedSettingsRoute = useRef(showSettings);
 
-  // Navigation history. Owned here because this is where every destination —
-  // the route, the open file, the section, the search term — actually lives.
-  // `apply` is the only thing that moves the app backwards or forwards; the
-  // refs it reads are assigned further down, so it is written as a ref-reading
-  // callback rather than closing over state directly.
-  const applyNavEntryRef = useRef<(entry: NavEntry) => void>(() => {});
-  const applyNavEntry = useCallback((entry: NavEntry) => applyNavEntryRef.current(entry), []);
-  const captureNavScroll = useCallback(() => window.scrollY, []);
+  const pendingNavigationRef = useRef<string | null>(null);
   const navHistory = useNavHistoryState({
-    apply: applyNavEntry,
-    captureScroll: captureNavScroll,
+    resolvePath: (entry) => {
+      const path =
+        entry.fileId && workspaceIdRef.current
+          ? workspacePath(workspaceIdRef.current, entry.fileId)
+          : (entry.path ?? "/");
+      pendingNavigationRef.current = path;
+      return path;
+    },
   });
   // Read by callbacks that must not be recreated when the history changes.
   const navHistoryRef = useRef(navHistory);
@@ -630,8 +622,6 @@ export function DocsApp({ initialExamWorkspace = false }: { initialExamWorkspace
   const readingModeRef = useRef(readingMode);
   const activeHeadingIdRef = useRef<string | null>(null);
   const workspaceIdRef = useRef<string | null>(null);
-  const workspaceKindRef = useRef<WorkspaceKind>("reader");
-  const [kind, setKind] = useState<WorkspaceKind>("reader");
   const workspaceNameRef = useRef("My workspace");
   const createdAtRef = useRef(Date.now());
   const hydratedRef = useRef(false);
@@ -701,7 +691,6 @@ export function DocsApp({ initialExamWorkspace = false }: { initialExamWorkspace
       id: workspaceIdRef.current ?? crypto.randomUUID(),
       revision: storageRevisionRef.current,
       name: workspaceNameRef.current,
-      kind: workspaceKindRef.current,
       createdAt: createdAtRef.current,
       updatedAt: Date.now(),
       files: s.files.map((f) => ({
@@ -883,8 +872,6 @@ export function DocsApp({ initialExamWorkspace = false }: { initialExamWorkspace
     // `background`: another tab saved this workspace while this one was idle.
     // Adopt its data without moving the reader's scroll or flashing a status.
     (ws: WorkspaceRecord, { background = false }: { background?: boolean } = {}) => {
-      workspaceKindRef.current = workspaceKind(ws);
-      setKind(workspaceKind(ws));
       storageRevisionRef.current = ws.revision;
       storedRecordRef.current = ws;
       baseRecordRef.current = ws;
@@ -915,6 +902,7 @@ export function DocsApp({ initialExamWorkspace = false }: { initialExamWorkspace
       // workspace is opened past that mark — which is also the only moment the
       // reader could have noticed it still being there.
       const swept = parsed.filter((f) => !isBinExpired(f.deletedAt));
+      snapshotRef.current = { ...snapshotRef.current, files: swept, folders: wsFolders };
       setFiles(swept);
       setFolders(wsFolders);
       setAutoEditFileId(null);
@@ -1010,9 +998,8 @@ export function DocsApp({ initialExamWorkspace = false }: { initialExamWorkspace
         // the route this instance replaced — so it reads what that route saw.
         const { list, ws } = await persistence.serial(async () => {
           let list = await persistence.listWorkspaceSummaries();
-          let hasLegacy = initialExamWorkspace;
+          let hasLegacy = false;
           if (
-            !hasLegacy &&
             typeof indexedDB.databases === "function" &&
             (await indexedDB.databases()).some((db) => db.name === "localdox-exams-v2")
           ) {
@@ -1022,17 +1009,15 @@ export function DocsApp({ initialExamWorkspace = false }: { initialExamWorkspace
             ).some((rows) => rows.length > 0);
           }
           if (hasLegacy && !list.some((w) => w.id === LEGACY_EXAM_WORKSPACE)) {
-            const legacy = newWorkspaceRecord("Exam Workspace", "exam");
+            const legacy = newWorkspaceRecord("Recovered exams");
             legacy.id = LEGACY_EXAM_WORKSPACE;
             await persistence.putWorkspace(legacy);
             list = await persistence.listWorkspaceSummaries();
           }
           if (list.length === 0 && !hashSharedWs) return { list, ws: undefined };
+          const requested = readAppRoute(window.location.pathname).workspaceId;
           const selected =
-            list.find(
-              (w) =>
-                w.id === (initialExamWorkspace ? LEGACY_EXAM_WORKSPACE : prefs.lastWorkspaceId),
-            ) ?? list[0];
+            list.find((w) => w.id === (requested ?? prefs.lastWorkspaceId)) ?? list[0];
           return { list, ws: hashSharedWs ?? (await persistence.getWorkspace(selected.id)) };
         });
         if (list.length === 0 && !hashSharedWs) {
@@ -1145,6 +1130,8 @@ export function DocsApp({ initialExamWorkspace = false }: { initialExamWorkspace
     }),
     [],
   );
+
+  const uploadedRulesOpenRef = useRef<(id: string) => void>(() => {});
 
   const addFiles = useCallback(
     async (fileList: File[], attachments = false): Promise<MdFile[]> => {
@@ -1335,8 +1322,19 @@ export function DocsApp({ initialExamWorkspace = false }: { initialExamWorkspace
           return [...kept, ...existing];
         }
 
+        const uploadedRules = kept.filter(isRulesFile);
         toast.success(`Successfully uploaded ${kept.length} file${kept.length > 1 ? "s" : ""}!`, {
           id: toastId,
+          ...(uploadedRules.length
+            ? {
+                description: "Rulesets are available in Settings → Exam rules.",
+                duration: 10000,
+                action: {
+                  label: "Open exam rules",
+                  onClick: () => uploadedRulesOpenRef.current(uploadedRules[0].id),
+                },
+              }
+            : {}),
         });
         if (!attachments) navigate({ to: "/" }); // Attachments keep the editor open.
         return [...kept, ...existing];
@@ -1503,10 +1501,6 @@ export function DocsApp({ initialExamWorkspace = false }: { initialExamWorkspace
       }
       setActiveHeadingId(targetHeadingId);
 
-      if (pathnameRef.current !== "/") {
-        navigate({ to: "/" });
-      }
-
       setDrawerOpen(false);
       markDirty();
       // Every in-app way of opening a document funnels through here — the
@@ -1580,7 +1574,7 @@ export function DocsApp({ initialExamWorkspace = false }: { initialExamWorkspace
         if (workspaceIdRef.current !== targetWorkspaceId) return;
         if (
           activeFileIdRef.current === source.id &&
-          pathnameRef.current === "/" &&
+          !readAppRoute(pathnameRef.current).settings &&
           !editorDirtyRef.current
         )
           handleSelect(derivative.id);
@@ -2042,6 +2036,12 @@ flowchart LR
 
   /** The New exam dialog, opened from the Create menu. */
   const [newExamOpen, setNewExamOpen] = useState(false);
+  const [newExamFolder, setNewExamFolder] = useState<string | null>(null);
+  const [configureExamId, setConfigureExamId] = useState<string | null>(null);
+  const openNewExam = useCallback((folderId: string | null = null) => {
+    setNewExamFolder(folderId);
+    setNewExamOpen(true);
+  }, []);
 
   /**
    * A new exam: an `.xam` paper whose header names its ruleset, plus that
@@ -2084,7 +2084,7 @@ flowchart LR
         size: content.length,
         addedAt: now,
         kind: "exam",
-        folderId: null,
+        folderId: newExamFolder,
         headings: [],
       });
       ensureWorkspace(made.length);
@@ -2104,7 +2104,7 @@ flowchart LR
           : `Its rules are in ${rules}, in Settings ▸ Exam rules. Replace the sample questions, then Save.`,
       });
     },
-    [location.pathname, navigate, markDirty, ensureWorkspace],
+    [location.pathname, navigate, markDirty, ensureWorkspace, newExamFolder],
   );
 
   /**
@@ -3099,16 +3099,113 @@ flowchart LR
   // ---- workspace management ----
 
   const switchWorkspace = useCallback(
-    async (id: string) => {
+    async (id: string, options?: { fromRoute?: boolean }) => {
       if (id === workspaceIdRef.current) return;
       if (!(await persistNow(true))) return;
       const ws = await persistence.serial(() => persistence.getWorkspace(id));
       if (!ws) return;
       hydrateWorkspace(ws);
       savePrefs({ lastWorkspaceId: id });
+      if (!options?.fromRoute && !readAppRoute(pathnameRef.current).settings) {
+        const path = workspacePath(id, ws.ui?.activeFileId);
+        pendingNavigationRef.current = path;
+        void navigate({ to: path });
+      }
     },
-    [persistNow, hydrateWorkspace],
+    [persistNow, hydrateWorkspace, navigate],
   );
+
+  const appliedRouteRef = useRef<string | null>(null);
+  const applyingRouteRef = useRef(false);
+  const routeTargetRef = useRef<{ workspaceId?: string; fileId?: string } | null>(null);
+  const [appliedRoute, setAppliedRoute] = useState<string | null>(null);
+  const [routeError, setRouteError] = useState<string | null>(null);
+  useEffect(() => {
+    if (booting) return;
+    const href = location.href;
+    if (appliedRouteRef.current === href) return;
+    applyingRouteRef.current = true;
+    routeTargetRef.current = readAppRoute(location.pathname);
+    let alive = true;
+    const apply = async () => {
+      const route = readAppRoute(location.pathname);
+      if (route.workspaceId && route.workspaceId !== workspaceIdRef.current) {
+        if (!workspaces.some((w) => w.id === route.workspaceId)) {
+          if (alive) setRouteError("This workspace is not available on this device.");
+          return;
+        }
+        await switchWorkspace(route.workspaceId, { fromRoute: true });
+      }
+      if (!alive) return;
+      if (route.fileId) {
+        const file = snapshotRef.current.files.find((f) => f.id === route.fileId && !f.deletedAt);
+        if (!file) {
+          setRouteError(
+            "This file is not available in this workspace. Choose a file from the sidebar.",
+          );
+          return;
+        }
+        setActiveFileId(route.fileId);
+        setActiveHeadingId(location.hash || "preamble");
+        if (location.hash) setScrollTarget(location.hash);
+      }
+      const state = location.state as typeof location.state & { localdoxQuery?: string | null };
+      if (state.localdoxQuery !== undefined) setHighlightQuery(state.localdoxQuery);
+      setRouteError(null);
+      setDrawerOpen(false);
+    };
+    void apply()
+      .catch((error) => {
+        if (alive)
+          setRouteError(
+            error instanceof Error ? error.message : "This destination could not be opened.",
+          );
+      })
+      .finally(() => {
+        if (alive) {
+          appliedRouteRef.current = href;
+          setAppliedRoute(href);
+          applyingRouteRef.current = false;
+        }
+      });
+    return () => {
+      alive = false;
+    };
+  }, [
+    booting,
+    location.href,
+    location.pathname,
+    location.hash,
+    location.state,
+    switchWorkspace,
+    workspaces,
+    setActiveFileId,
+  ]);
+
+  useEffect(() => {
+    if (booting || showSettings || routeError || applyingRouteRef.current || !workspaceId) return;
+    if (pendingNavigationRef.current && pendingNavigationRef.current !== location.pathname) return;
+    pendingNavigationRef.current = null;
+    if (appliedRoute !== location.href) return;
+    const target = routeTargetRef.current;
+    if (target?.workspaceId && target.workspaceId !== workspaceId) return;
+    if (target?.fileId && target.fileId !== activeFileId) return;
+    routeTargetRef.current = null;
+    const path = workspacePath(workspaceId, activeFileId);
+    if (location.pathname !== path)
+      void navigate({ to: path, hash: location.hash, replace: true, resetScroll: false });
+  }, [
+    appliedRoute,
+    booting,
+    showSettings,
+    routeError,
+    workspaceId,
+    activeFileId,
+    location.href,
+    location.pathname,
+    location.hash,
+    navigate,
+  ]);
 
   // ---- other tabs ----
   //
@@ -3416,13 +3513,13 @@ flowchart LR
   const storedWorkspaces = useCallback(() => persistence.listWorkspaceSummaries(), []);
 
   const newWorkspace = useCallback(
-    async (name?: string, kind: WorkspaceKind = "reader") => {
+    async (name?: string) => {
       const asked = name || window.prompt("Enter new workspace name:");
       if (!asked) return;
       const finalName = resolveWorkspaceName(asked, await storedWorkspaces());
       if (!finalName) return;
       if (!(await persistNow(true))) return;
-      const ws = newWorkspaceRecord(finalName, kind);
+      const ws = newWorkspaceRecord(finalName);
       await persistence.serial(() => persistence.putWorkspace(ws));
       await refreshWorkspaceList();
       hydrateWorkspace(ws);
@@ -3717,7 +3814,7 @@ flowchart LR
       }
       const { list, next } = await persistence.serial(async () => {
         const record = await persistence.getWorkspace(id);
-        if (record?.kind === "exam") {
+        if (record) {
           try {
             await (
               await import("@/services/exams/manage")
@@ -4079,40 +4176,43 @@ flowchart LR
   );
 
   const goHome = useCallback(() => navigate({ to: "/" }), [navigate]);
-  // An optional tab lands the dialog straight on a section — "All workspaces"
-  // in the workspace menus opens it on workspace settings rather than making
-  // you find the tab yourself.
-  //
-  // Held outside the component: opening settings is a route change, and this
-  // component *is* the route, so it remounts on the way there and any state or
-  // ref holding the request is wiped before the dialog mounts to read it.
+  const settingsReturnRef = useRef<string | null>(null);
   const openSettings = useCallback(
     (tab?: "workspace" | "exams") => {
-      pendingSettingsTab = tab;
-      navigate({ to: "/settings" });
-      navHistoryRef.current.push({ path: "/settings", fileId: null, headingId: null });
+      if (!readAppRoute(pathnameRef.current).settings) settingsReturnRef.current = location.href;
+      navigate({ to: settingsPath(tab) });
     },
-    [navigate],
+    [navigate, location.href],
   );
-  /** Rulesets are edited in Settings, not the reader: open it on this one. */
   const openRulesSettings = useCallback(
     (fileId: string) => {
-      pendingSettingsRules = fileId;
-      openSettings("exams");
+      if (!readAppRoute(pathnameRef.current).settings) settingsReturnRef.current = location.href;
+      navigate({ to: settingsPath("exams", fileId) });
     },
-    [openSettings],
+    [navigate, location.href],
   );
 
-  // Closing the dialog is a route change back to the reader. Going through the
-  // trail rather than straight to "/" keeps whatever document was open, and
-  // means the close button, Escape, the backdrop and back all do one thing.
+  const openPracticeSettings = useCallback(
+    (fileId: string) => {
+      if (!readAppRoute(pathnameRef.current).settings) settingsReturnRef.current = location.href;
+      navigate({ to: settingsPath("practice", fileId) });
+    },
+    [navigate, location.href],
+  );
+  uploadedRulesOpenRef.current = openRulesSettings;
+
   const closeSettings = useCallback(() => {
-    // Spent: the next plain open starts where it always did.
-    pendingSettingsTab = undefined;
-    pendingSettingsRules = undefined;
     pendingSettingsFocus = true;
-    if (navHistoryRef.current.canBack) navHistoryRef.current.back();
-    else navigate({ to: "/" });
+    const previous = settingsReturnRef.current;
+    const sameWorkspace =
+      previous && readAppRoute(previous.split(/[?#]/)[0]).workspaceId === workspaceIdRef.current;
+    const destination = sameWorkspace
+      ? previous
+      : workspaceIdRef.current
+        ? workspacePath(workspaceIdRef.current, activeFileIdRef.current)
+        : "/";
+    const [path, hash = ""] = destination.split("#");
+    navigate({ to: path, hash, resetScroll: false });
   }, [navigate]);
 
   // Settings changes routes, so the invoking button can be replaced. Restore
@@ -4127,53 +4227,6 @@ flowchart LR
       pendingSettingsFocus = false;
     }
   }, [showSettings, booting]);
-
-  // Put the app into a recorded destination. This is the inverse of `push`: it
-  // restores the route, the document, the section, the search term and the
-  // scroll offset, without recording anything itself (the history suppresses
-  // pushes while it is applying, which is what keeps the forward trail alive).
-  applyNavEntryRef.current = (entry: NavEntry) => {
-    if (pathnameRef.current !== entry.path) navigate({ to: entry.path });
-    setHighlightQuery(entry.query);
-    // A reader entry always names its document. An entry without one is a
-    // non-reader destination (settings), where the open file is left as it is so
-    // coming back out of it lands on the document that was already open.
-    if (entry.fileId) {
-      setActiveFileId(entry.fileId);
-      setActiveHeadingId(entry.headingId);
-    }
-    setDrawerOpen(false);
-    // After the document has painted. Restoring the offset before the content
-    // exists would scroll a short page and land at the top.
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => window.scrollTo({ top: entry.scrollY }));
-    });
-  };
-
-  // Seed the trail with wherever the reader landed, so the first back has
-  // somewhere to return to and the first open is not also the first entry.
-  //
-  // Waits for the document, not just for `booting`: hydration sets the open file
-  // and clears the boot flag in the same commit, so an effect keyed on `booting`
-  // alone reads `activeFileId` as null and seeds an entry that restores nothing.
-  // Settings is seeded without one, since it legitimately has no open document.
-  const navSeededRef = useRef(false);
-  useEffect(() => {
-    if (booting || navSeededRef.current) return;
-    if (!activeFileId && !showSettings) return;
-    navSeededRef.current = true;
-    // A trail restored from the session already knows where we are; seeding on
-    // top of it would record the landing twice and make the first back a no-op.
-    if (navHistoryRef.current.canBack || navHistoryRef.current.canForward) return;
-    navHistoryRef.current.push({
-      path: location.pathname,
-      fileId: activeFileId,
-      headingId: activeHeadingId,
-      query: highlightQuery,
-    });
-    // Runs once, on the first render that has somewhere to return to.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [booting, activeFileId, showSettings]);
 
   // App-level dismissables. Each is registered while open so back closes it
   // before it walks the trail — the reader's last action was opening the panel,
@@ -4206,21 +4259,17 @@ flowchart LR
     });
   }, [searchOpen, registerEscape]);
 
-  // The browser's own back/gesture is the same intent as the header's back, so
-  // it runs the same code — including closing an open mode first. `popstate`
-  // fires after the router has already moved, so the route is put back when an
-  // escape swallowed the gesture.
-  useEffect(() => {
-    const onPopState = () => {
-      if (navHistoryRef.current.popEscape()) {
-        window.history.forward();
-        return;
-      }
-      navHistoryRef.current.back();
-    };
-    window.addEventListener("popstate", onPopState);
-    return () => window.removeEventListener("popstate", onPopState);
-  }, []);
+  useBlocker({
+    enableBeforeUnload: false,
+    shouldBlockFn: ({ next, action }) => {
+      if (action === "BACK" && navHistoryRef.current.popEscape()) return true;
+      const target = readAppRoute(next.pathname);
+      if (target.settings) return false;
+      const leavingWorkspace = target.workspaceId && target.workspaceId !== workspaceIdRef.current;
+      const leavingFile = target.fileId && target.fileId !== activeFileIdRef.current;
+      return !!(leavingWorkspace || leavingFile) && !confirmDiscardDraft(target.fileId);
+    },
+  });
 
   // Ask AI: opened either from the sidebar (no prefill) or from a text-selection
   // quick action in the reader (seeded with the selection + chosen action).
@@ -4443,13 +4492,34 @@ flowchart LR
       const stem = requested.replace(/\.xrule$/i, "").trim() || "Rules";
       ensureWorkspace(1);
       const made = addTextFile(`${stem}.xrule`, RULES_TEMPLATES[template](stem), null);
-      // The first file replaces the empty-workspace view and remounts Settings.
-      pendingSettingsTab = "exams";
-      pendingSettingsRules = made.id;
+      navigate({ to: settingsPath("exams", made.id), replace: true });
       return made;
     },
-    [ensureWorkspace, addTextFile],
+    [ensureWorkspace, addTextFile, navigate],
   );
+
+  const requestNewRuleset = useCallback(() => {
+    const name = window.prompt("Name for the new ruleset:", "Exam rules");
+    if (!name?.trim()) return;
+    const made = createRules(name.trim(), "default");
+    openRulesSettings(made.id);
+  }, [createRules, openRulesSettings]);
+
+  const configuredExam = files.find((f) => f.id === configureExamId && !f.deletedAt);
+  const configureExamDialog = configuredExam ? (
+    <LazyBoundary>
+      <ExamConfigureDialog
+        key={configuredExam.id}
+        file={configuredExam}
+        files={files}
+        folders={folders}
+        onAddRules={addTextFile}
+        onSave={handleContentChange}
+        onEditRules={openRulesSettings}
+        onClose={() => setConfigureExamId(null)}
+      />
+    </LazyBoundary>
+  ) : null;
 
   const moveDialog = (
     <MoveToWorkspaceDialog
@@ -4511,8 +4581,18 @@ flowchart LR
         onImportWorkspace={importWorkspace}
         onExportWorkspace={exportWorkspace}
         onShareWorkspace={shareWorkspace}
-        initialTab={pendingSettingsTab}
-        initialRulesId={pendingSettingsRules}
+        initialTab={appRoute.section}
+        initialRulesId={appRoute.rulesId}
+        initialPracticeId={
+          appRoute.practiceId ??
+          (files.find((f) => f.id === activeFileId)?.kind === "practice"
+            ? (activeFileId ?? undefined)
+            : undefined)
+        }
+        onPracticeChange={(id) => navigate({ to: settingsPath("practice", id) })}
+        onAddTextFile={addTextFile}
+        onTabChange={(tab) => navigate({ to: settingsPath(tab) })}
+        onRulesChange={(id) => navigate({ to: settingsPath("exams", id) })}
         onSaveFile={handleContentChange}
         onCreateRules={createRules}
         onBinFile={binNow}
@@ -4571,23 +4651,53 @@ flowchart LR
       />
     ) : null);
 
-  // Exam Workspaces study `.xam` files in place; the paper needs its siblings
+  // Workspaces study `.xam` files in place; the paper needs its siblings
   // (rules, images) and the folder tree that scopes them.
   const examWorkspace = useMemo<ExamWorkspace | null>(
     () =>
       workspaceId
         ? {
             workspaceId,
-            examEnabled: kind === "exam",
             paused: showSettings,
             files,
             folders,
             openFile: navToFile,
             openRules: openRulesSettings,
+            openPractice: openPracticeSettings,
             addTextFile,
           }
         : null,
-    [kind, workspaceId, showSettings, files, folders, navToFile, openRulesSettings, addTextFile],
+    [
+      workspaceId,
+      showSettings,
+      files,
+      folders,
+      navToFile,
+      openRulesSettings,
+      openPracticeSettings,
+      addTextFile,
+    ],
+  );
+
+  const routeNotice = routeError && (
+    <div
+      role="alert"
+      className="fixed bottom-5 left-1/2 z-50 w-[calc(100%-2rem)] max-w-lg -translate-x-1/2 rounded-lg border border-border bg-background p-4 text-sm shadow-lg"
+    >
+      {routeError}
+      <button
+        className="ml-3 underline"
+        onClick={() => {
+          setRouteError(null);
+          navigate({
+            to: workspaceId ? workspacePath(workspaceId, activeFileId) : "/",
+            replace: true,
+          });
+        }}
+      >
+        Open current workspace
+      </button>
+    </div>
   );
 
   if (booting) {
@@ -4610,13 +4720,19 @@ flowchart LR
         shareDialog={shareDialog}
         settingsDialog={settingsDialog}
         moveDialog={moveDialog}
-        statusBanner={statusBanner}
+        statusBanner={
+          <>
+            {statusBanner}
+            {routeNotice}
+          </>
+        }
       />
     );
   }
 
   return (
     <NavHistoryContext.Provider value={navHistory}>
+      {routeNotice}
       <ExamWorkspaceContext.Provider value={examWorkspace}>
         <DraftJournalContext.Provider value={journalContext}>
           <div className="min-h-dvh bg-background">
@@ -4668,13 +4784,15 @@ flowchart LR
                     onShareFiles={(ids) => void shareFiles(ids)}
                     onRenameFile={renameFile}
                     onEditFile={editFile}
+                    onConfigureExam={setConfigureExamId}
                     onConvertFile={conversion.start}
                     convertingFileId={conversion.runningId}
                     folders={folders}
                     onCreateFile={createFile}
                     onCreateMermaid={createMermaidFile}
                     onCreateBoard={createBoardFile}
-                    onCreateExam={() => setNewExamOpen(true)}
+                    onCreateExam={openNewExam}
+                    onCreateRules={requestNewRuleset}
                     onCreatePractice={createPracticeFile}
                     onCreateFolder={createFolder}
                     onRenameFolder={renameFolder}
@@ -4766,7 +4884,8 @@ flowchart LR
                     onCreateMermaid={() => createMermaidFile(null)}
                     onCreateBoard={() => createBoardFile(null)}
                     onCreateFolder={promptNewFolderFromRail}
-                    onCreateExam={() => setNewExamOpen(true)}
+                    onCreateExam={openNewExam}
+                    onCreateRules={requestNewRuleset}
                     onCreatePractice={() => createPracticeFile(null)}
                     onUpload={() => inputRef.current?.click()}
                     buttonClassName={CHROME_BUTTON}
@@ -4860,13 +4979,15 @@ flowchart LR
                       onShareFiles={(ids) => void shareFiles(ids)}
                       onRenameFile={renameFile}
                       onEditFile={editFile}
+                      onConfigureExam={setConfigureExamId}
                       onConvertFile={conversion.start}
                       convertingFileId={conversion.runningId}
                       folders={folders}
                       onCreateFile={createFile}
                       onCreateMermaid={createMermaidFile}
                       onCreateBoard={createBoardFile}
-                      onCreateExam={() => setNewExamOpen(true)}
+                      onCreateExam={openNewExam}
+                      onCreateRules={requestNewRuleset}
                       onCreatePractice={createPracticeFile}
                       onCreateFolder={createFolder}
                       onRenameFolder={renameFolder}
@@ -5264,6 +5385,7 @@ flowchart LR
             {moveDialog}
             {binDialog}
             {newExamDialog}
+            {configureExamDialog}
 
             {dragOverlay}
             {shareDialog}

@@ -202,7 +202,6 @@ const uiSchema = z
   });
 
 const workspaceSchema = z.object({
-  kind: z.enum(["exam", "documentation", "reader"]).default("reader"),
   id: id.optional().catch(undefined),
   name: z
     .string()

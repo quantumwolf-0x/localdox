@@ -111,6 +111,8 @@ test("theme, reading, equation, and diagram choices persist through reopening", 
       diagramNumbers: false,
     });
   await page.reload();
+  await expect(page).toHaveURL(/\/settings\/diagrams$/);
+  await settings(page).getByRole("tab", { name: "Appearance", exact: true }).click();
   await expect(settings(page).getByRole("button", { name: "Dark", exact: true })).toHaveAttribute(
     "aria-pressed",
     "true",
@@ -186,6 +188,7 @@ for (const width of [320, 390, 768, 1440]) {
       "Ask AI",
       "Workspace",
       "Exam rules",
+      "Practice",
       "Storage",
     ]) {
       await dialog.getByRole("tab", { name, exact: true }).click();
@@ -240,7 +243,8 @@ test("rulesets expose primary and nested advanced controls and reject invalid va
     .check();
   await dialog
     .getByRole("combobox", { name: "Full exam rules · Tools · Calculator", exact: true })
-    .selectOption("scientific");
+    .click();
+  await page.getByRole("option", { name: "Scientific", exact: true }).click();
   await dialog.getByRole("button", { name: "JSON", exact: true }).click();
   const json = JSON.parse(
     await dialog.getByRole("textbox", { name: "Edit Custom quiz.xrule", exact: true }).inputValue(),
