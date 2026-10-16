@@ -55,9 +55,9 @@ Why these choices:
 - **Quote anchor, not offsets.** Any edit above a passage shifts every offset
   below it. The quote (with prefix and suffix) is the same scheme highlights
   use (`text-offsets.ts`), so a note survives edits around it.
-- **The live name wins.** While the document exists, the panel shows its
-  _current_ name, looked up by `fileId`. A rename never leaves a note pointing
-  at a stale name. `fileName` is only a fallback.
+- **The live name wins.** Search and accessible source descriptions use the
+  document's _current_ name, looked up by `fileId`. A rename never leaves a note
+  pointing at a stale name. `fileName` is only a fallback.
 - **Notes outlive documents.** Highlights (and legacy stars) are dropped with their
   file in import validation and merge. Notes are not: they carry their own
   text.
@@ -124,7 +124,7 @@ browser globals, so the conversion is unit-tested in Node.
 ## Flow: following a source link
 
 ```
-click "guide.md › Measurements" → DocsApp.openNoteSource(note)
+click a note card → DocsApp.openNoteSource(note)
   (a highlight card: openHighlight(h) → highlightSource(h), same path)
   openPassage(fileId, source)
   resolveNoteSource({ source }, file) pure; reads Markdown, not the DOM
@@ -175,8 +175,8 @@ is listed has changed.
 - **Shown as a note, not painted.** A column of yellow and pink blocks is
   tiring to read beside a document, and the colour only has to say "this is a
   highlight". The card shows the text plainly. An 8px dot of its colour sits
-  where a note shows its document icon. Screen readers hear "Highlight in
-  guide.md › Install".
+  beside the action icons. A hidden source button keeps the jump accessible
+  from the keyboard and to screen readers.
 - **One order.** `notebookEntries(notes, highlights)` sorts both by
   `createdAt`, newest first. Highlights got an optional `createdAt` for this
   (set in `DocsApp.addHighlight`, kept by `import-schema.ts`). Older ones have
@@ -213,20 +213,41 @@ Panel open/closed is a per-device convenience in `localStorage`
 
 ## UI
 
+The **Notes** tab offers **Cards** and **File** views. File view merges every
+saved note and highlight into one read-only `notes.md`, in the same newest-first
+order as the cards, preserving the notes' original Markdown. Entries flow as
+continuous content with blank lines between them; no generated headings,
+source labels, highlight labels, or separator lines are added. It
+includes notes saved from rough work and notes whose sources were deleted.
+File view shows clean, rendered content with a copy icon at its top-right to
+copy the merged Markdown. The expand button opens a larger view, and the download
+button in either view saves the whole file. Card search never limits the content,
+copy, or download. The merged file
+updates as notes change and does not create or modify a workspace document.
+
+Each note and highlight card also has a **Move to rough work** icon beside its
+copy and delete actions. It transfers the text to a new scratchpad linked to
+the source document, removes the original note or highlight, and opens the
+**Rough work** tab. Existing scratchpads are preserved. The toast offers **Undo**;
+if the new scratchpad has been edited, Undo restores the original entry and
+keeps those edits in rough work.
+
 The panel has three tabs: **Notes**, **Rough work** (scratchpads; see
 rough-work.md) and **Compute** (an on-device math engine; see
 math-compute.md). A note saved from rough work carries `origin` instead of a
-source passage, and its link opens the scratchpad.
+source passage, and clicking its card opens the scratchpad.
 
 - **Desktop (≥1024px):** a docked column (`w-80`, `xl:w-88`) right of the
   reading column, sticky to the viewport. It stays open across documents and
   reloads.
-- **Narrower:** the app's `BottomSheet`. Opening a source link closes the sheet,
+- **Narrower:** the app's `BottomSheet`. Clicking a card closes the sheet,
   since it would cover the passage.
 - Open with the notebook button in the viewer header (`aria-pressed`). Each
-  note shows its source link, its rendered Markdown (folded past 288px, with
-  equations and diagrams drawn; see below), when
-  it was taken or edited, and Copy / Edit / Delete. Edit opens a Markdown
+  note shows its rendered Markdown (folded past 288px, with equations and diagrams
+  drawn; see below) and Copy / Move to rough work / Edit / Delete. Source headings
+  and timestamps are hidden; the existing newest-first order is preserved.
+  Clicking the card opens its source passage or scratchpad. Action icons, links,
+  editing controls, and text selection do not trigger a source jump. Edit opens a Markdown
   textarea: ⌘/Ctrl+Enter saves, Esc cancels. Delete is immediate, with **Undo**
   in the toast. Search matches every word across content, the source's current
   name and the section.

@@ -67,7 +67,11 @@ async function goToPage(page: Page, title: string) {
   await expect(page.getByRole("heading", { name: title, level: 1 })).toBeVisible();
 }
 
-test("select, save a note, reload, open it, and return to its source", async ({ page }) => {
+test("select, save a note, reload, open it, and return to its source", async ({
+  page,
+  context,
+}) => {
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
   const errors: string[] = [];
   page.on("pageerror", (e) => errors.push(e.message));
   await page.setViewportSize({ width: 1440, height: 900 });
@@ -109,6 +113,8 @@ test("select, save a note, reload, open it, and return to its source", async ({ 
   await expect(panel).toBeVisible();
   const card = panel.getByRole("listitem").filter({ hasText: QUOTE_START });
   await expect(card).toHaveCount(1);
+  await expect(card).not.toContainText("guide.md");
+  await expect(card).not.toContainText("just now");
   // Rendered from clean Markdown: emphasis, a real list, inline code.
   await expect(card.locator("strong")).toHaveText("wind speed");
   await expect(card.locator("li")).toHaveText(["Check the anemometer", "Log it with units=m/s"]);
@@ -125,8 +131,9 @@ test("select, save a note, reload, open it, and return to its source", async ({ 
   // note and the open panel both survive.
   await expect.poll(() => storedNoteCount(page)).toBe(1);
   await page.reload();
-  // The document reopens (on its first page — the open page isn't restored).
-  await expect(page.getByRole("heading", { name: "Field guide", level: 1 })).toBeVisible();
+  // The route may restore the selected page. Open another page explicitly
+  // before exercising the note card's navigation below.
+  await goToPage(page, "Field guide");
   const reloadedPanel = page.getByRole("region", { name: "Notes panel" });
   await expect(reloadedPanel).toBeVisible();
   const reloadedCard = reloadedPanel.getByRole("listitem").filter({ hasText: QUOTE_START });
@@ -140,8 +147,15 @@ test("select, save a note, reload, open it, and return to its source", async ({ 
   await expect(reloadedCard).toHaveCount(1);
   await search.fill("");
 
-  // From another page of the document, follow the note back to its passage.
-  await reloadedCard.getByRole("button", { name: "guide.md › Measurements" }).click();
+  // Action icons operate on the note without jumping to its source.
+  await reloadedCard.getByRole("button", { name: "Copy note", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Field guide", level: 1 })).toBeVisible();
+  await reloadedCard.getByRole("button", { name: "Edit note", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Field guide", level: 1 })).toBeVisible();
+  await reloadedPanel.getByRole("button", { name: "Cancel", exact: true }).click();
+
+  // From another page of the document, clicking the content opens the passage.
+  await reloadedCard.locator(".docs-note").click({ position: { x: 20, y: 12 } });
   await expect(page.getByRole("heading", { name: "Measurements", level: 1 })).toBeVisible();
   await expect
     .poll(() =>
@@ -158,6 +172,16 @@ test("select, save a note, reload, open it, and return to its source", async ({ 
     ]);
   await expect(page.locator("article p").filter({ hasText: QUOTE_START })).toBeInViewport();
 
+  // The card also has a keyboard-accessible source action, without a visible label.
+  await goToPage(page, "Field guide");
+  const jump = reloadedCard.getByRole("button", {
+    name: "Go to this passage in guide.md",
+    exact: true,
+  });
+  await jump.focus();
+  await jump.press("Enter");
+  await expect(page.getByRole("heading", { name: "Measurements", level: 1 })).toBeVisible();
+
   expect(errors).toEqual([]);
 });
 
@@ -172,6 +196,249 @@ test("on a narrow screen the panel is a sheet", async ({ page }) => {
   await expect(page.getByRole("region", { name: "Notes panel" })).toHaveCount(0);
   await page.keyboard.press("Escape");
   await expect(sheet).toBeHidden();
+});
+
+for (const width of [1440, 390]) {
+  test(`notes and highlights move to rough work, persist, and can be undone at ${width}px`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 900 });
+    await openGuide(page);
+    await goToPage(page, "Measurements");
+    const select = async (prefix: string) => {
+      await page.locator("article").evaluate((article, prefix) => {
+        const paragraph = [...article.querySelectorAll("p")].find((p) =>
+          p.textContent?.startsWith(prefix),
+        )!;
+        const range = document.createRange();
+        range.selectNodeContents(paragraph);
+        getSelection()!.removeAllRanges();
+        getSelection()!.addRange(range);
+        paragraph.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+      }, prefix);
+    };
+    const stored = () =>
+      page.evaluate(
+        () =>
+          new Promise<{
+            notes: Array<{ content: string }>;
+            scratchpads: Array<{ content: string; fileId: string | null }>;
+            highlights: Array<{ text: string }>;
+          }>((resolve, reject) => {
+            const open = indexedDB.open("localdox");
+            open.onerror = () => reject(open.error);
+            open.onsuccess = () => {
+              const db = open.result;
+              const all = db.transaction("workspaces").objectStore("workspaces").getAll();
+              all.onerror = () => reject(all.error);
+              all.onsuccess = () => {
+                db.close();
+                resolve(all.result[0]);
+              };
+            };
+          }),
+      );
+    const noteText = "Record the **wind speed** before you set up the mast.";
+    await select("Record the");
+    await page.getByRole("button", { name: "Copy selection to notes" }).click();
+    await select("Closing paragraph");
+    await page.getByRole("button", { name: "Highlight #fde047", exact: true }).click();
+    await page.getByRole("button", { name: "Notes", exact: true }).click();
+    const panel =
+      width === 1440
+        ? page.getByRole("region", { name: "Notes panel" })
+        : page.getByRole("dialog", { name: "Notes", exact: true });
+    const field = page.locator("textarea[id^='scratchpad-']");
+    const notesTab = panel.getByRole("tab", { name: /^Notes/ });
+    const roughTab = panel.getByRole("tab", { name: "Rough work", exact: true });
+
+    // Moving uses its own pad and preserves work that was already there.
+    await roughTab.click();
+    await panel.getByRole("button", { name: "New scratchpad", exact: true }).click();
+    await field.fill("Existing rough work");
+    await notesTab.click();
+    const noteCard = panel.getByRole("listitem").filter({ hasText: "Record the wind speed" });
+    await noteCard.getByRole("button", { name: "Move to rough work", exact: true }).click();
+    await expect(roughTab).toHaveAttribute("aria-selected", "true");
+    await expect(field).toHaveValue(noteText);
+    await expect
+      .poll(async () => {
+        const value = await stored();
+        return { notes: value.notes.length, pads: value.scratchpads.map((pad) => pad.content) };
+      })
+      .toEqual({ notes: 0, pads: ["Existing rough work", noteText] });
+    expect((await stored()).scratchpads.every((pad) => pad.fileId !== null)).toBe(true);
+    await page.getByRole("button", { name: "Undo", exact: true }).click();
+    await expect(noteCard).toBeVisible();
+    await expect
+      .poll(async () => (await stored()).scratchpads.map((pad) => pad.content))
+      .toEqual(["Existing rough work"]);
+
+    // Highlight cards have the same action. Undo preserves newly typed work,
+    // including text not yet handed over by the debounced editor.
+    const highlightCard = panel.getByRole("listitem").filter({ hasText: "Closing paragraph" });
+    await highlightCard.getByRole("button", { name: "Move to rough work", exact: true }).click();
+    await expect(field).toHaveValue("Closing paragraph of the measurements page.");
+    await expect.poll(async () => (await stored()).highlights.length).toBe(0);
+    await field.fill("Changed rough work");
+    await page.getByRole("button", { name: "Undo", exact: true }).click();
+    await expect(highlightCard).toBeVisible();
+    await expect
+      .poll(async () => (await stored()).scratchpads.map((pad) => pad.content))
+      .toEqual(["Existing rough work", "Changed rough work"]);
+
+    await noteCard.getByRole("button", { name: "Move to rough work", exact: true }).click();
+    await expect(field).toHaveValue(noteText);
+    await expect
+      .poll(async () => {
+        const value = await stored();
+        return { notes: value.notes.length, pads: value.scratchpads.map((pad) => pad.content) };
+      })
+      .toEqual({ notes: 0, pads: ["Existing rough work", "Changed rough work", noteText] });
+    await page.reload();
+    await roughTab.click();
+    await expect(field).toHaveValue(noteText);
+    await notesTab.click();
+    await expect(noteCard).toHaveCount(0);
+    await expect(highlightCard).toBeVisible();
+    await expect(highlightCard).not.toContainText("guide.md");
+    if (width === 390) await page.keyboard.press("Escape");
+    await goToPage(page, "Field guide");
+    if (width === 390) await page.getByRole("button", { name: "Notes", exact: true }).click();
+    await highlightCard.locator(".docs-note").click();
+    await expect(page.getByRole("heading", { name: "Measurements", level: 1 })).toBeVisible();
+    await expect
+      .poll(() =>
+        page.evaluate(() =>
+          [
+            ...((CSS as unknown as { highlights: Map<string, Set<Range>> }).highlights.get(
+              "dc-saved-flash",
+            ) ?? []),
+          ].map((range) => range.toString()),
+        ),
+      )
+      .toEqual(["Closing paragraph of the measurements page."]);
+    if (width === 390) await expect(panel).toBeHidden();
+  });
+}
+
+test("all notes have card and file views, a complete preview, and matching Markdown downloads", async ({
+  page,
+  context,
+}) => {
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await openGuide(page);
+  const selectParagraph = async (startsWith: string) => {
+    await page.locator("article").evaluate((article, prefix) => {
+      const paragraph = [...article.querySelectorAll("p")].find((p) =>
+        p.textContent?.startsWith(prefix),
+      )!;
+      const range = document.createRange();
+      range.selectNodeContents(paragraph);
+      getSelection()!.removeAllRanges();
+      getSelection()!.addRange(range);
+      paragraph.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+    }, startsWith);
+  };
+  await selectParagraph("Opening words");
+  await page.getByRole("button", { name: "Copy selection to notes" }).click();
+  await goToPage(page, "Measurements");
+  await selectParagraph("Record the");
+  await page.getByRole("button", { name: "Copy selection to notes" }).click();
+  await selectParagraph("Closing paragraph");
+  await page.getByRole("button", { name: "Highlight #fde047", exact: true }).click();
+  await page.getByRole("button", { name: "Notes", exact: true }).click();
+  const panel = page.getByRole("region", { name: "Notes panel" });
+  await expect(
+    panel.getByRole("list", { name: "Notes", exact: true }).locator(":scope > li"),
+  ).toHaveCount(3);
+  const firstParagraphs = panel
+    .getByRole("list", { name: "Notes", exact: true })
+    .locator(":scope > li .docs-note > p:first-child");
+  await expect(firstParagraphs).toHaveText([
+    "Closing paragraph of the measurements page.",
+    "Record the wind speed before you set up the mast.",
+    "Opening words of the guide.",
+  ]);
+
+  const opening = panel.getByRole("listitem").filter({ hasText: "Opening words" });
+  await opening.getByRole("button", { name: "Edit note" }).click();
+  const longNote = `**Edited opening**\n\n${"Long passage. ".repeat(400)}\n\nEnd of the entire note.`;
+  await panel.getByRole("textbox", { name: "Note text (Markdown)" }).fill(longNote);
+  await panel.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(firstParagraphs).toHaveText([
+    "Closing paragraph of the measurements page.",
+    "Record the wind speed before you set up the mast.",
+    "Edited opening",
+  ]);
+  await panel.getByRole("searchbox", { name: "Search notes" }).fill("wind");
+  await expect(panel.getByRole("listitem")).toHaveCount(1);
+
+  const downloadText = async (scope: ReturnType<Page["getByRole"]>, name: string) => {
+    const pending = page.waitForEvent("download");
+    await scope.getByRole("button", { name, exact: true }).click();
+    const download = await pending;
+    expect(download.suggestedFilename()).toBe("notes.md");
+    const stream = await download.createReadStream();
+    const chunks: Buffer[] = [];
+    for await (const chunk of stream!) chunks.push(Buffer.from(chunk));
+    return Buffer.concat(chunks).toString("utf8");
+  };
+  const fromCards = await downloadText(panel, "Download all notes as Markdown");
+  expect(fromCards).toContain(longNote);
+  expect(fromCards).toContain("Record the **wind speed**");
+  expect(fromCards).toContain("Closing paragraph of the measurements page");
+  expect(fromCards).toBe(
+    `Closing paragraph of the measurements page\\.\n\nRecord the **wind speed** before you set up the mast.\n\n${longNote}\n`,
+  );
+
+  await panel.getByRole("button", { name: "File", exact: true }).click();
+  await expect(panel.getByRole("button", { name: "File", exact: true })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+  const preview = panel.getByLabel("Combined notes content", { exact: true });
+  await expect(preview).toContainText("End of the entire note.");
+  await expect(preview.locator("strong").filter({ hasText: "wind speed" })).toHaveCount(1);
+  await expect(panel.getByRole("button", { name: "Preview", exact: true })).toHaveCount(0);
+  await expect(panel.getByRole("button", { name: "Markdown", exact: true })).toHaveCount(0);
+  const copyContent = async (scope: ReturnType<Page["getByRole"]>) => {
+    const copy = scope.getByRole("button", { name: "Copy content", exact: true });
+    await expect(copy).toHaveText("");
+    await copy.click();
+    await expect(scope.getByRole("button", { name: "Copied", exact: true })).toBeVisible();
+    expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(fromCards);
+  };
+  await copyContent(panel);
+  expect(await downloadText(panel, "Download all notes as Markdown")).toBe(fromCards);
+
+  await panel.getByRole("button", { name: "Preview all notes", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "All notes", exact: true });
+  await expect(dialog.getByLabel("Combined notes content", { exact: true })).toContainText(
+    "End of the entire note.",
+  );
+  await copyContent(dialog);
+  expect(await downloadText(dialog, "Download Markdown")).toBe(fromCards);
+  await dialog.getByRole("button", { name: "Close", exact: true }).click();
+  await panel.getByRole("button", { name: "Cards", exact: true }).click();
+  await expect(panel.getByRole("searchbox", { name: "Search notes" })).toHaveValue("wind");
+
+  // The same file and expanded preview work inside the mobile sheet.
+  await page.setViewportSize({ width: 390, height: 844 });
+  const sheet = page.getByRole("dialog", { name: "Notes", exact: true });
+  await expect(sheet).toBeVisible();
+  await sheet.getByRole("button", { name: "File", exact: true }).click();
+  await expect(sheet.getByLabel("Combined notes content", { exact: true })).toContainText(
+    "End of the entire note.",
+  );
+  await copyContent(sheet);
+  await sheet.getByRole("button", { name: "Preview all notes", exact: true }).click();
+  await expect(dialog).toBeVisible();
+  await copyContent(dialog);
+  await dialog.getByRole("button", { name: "Close", exact: true }).click();
+  await expect(sheet).toBeVisible();
+  expect(await downloadText(sheet, "Download all notes as Markdown")).toBe(fromCards);
 });
 
 const FIGURES = [

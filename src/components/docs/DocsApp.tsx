@@ -205,6 +205,7 @@ import {
   type Note,
   type NoteDraft,
   type NoteSource,
+  type NotebookEntry,
 } from "@/lib/workspace/notes";
 import {
   createScratchpad,
@@ -2604,6 +2605,83 @@ flowchart LR
     setActivePadId(pad.id);
     markDirty();
   }, [markDirty, readerFile]);
+
+  const moveToRoughWork = useCallback(
+    (entry: NotebookEntry) => {
+      const snapshot = snapshotRef.current;
+      const note =
+        entry.kind === "note"
+          ? snapshot.notes.find((item) => item.id === entry.note.id)
+          : undefined;
+      const highlight =
+        entry.kind === "highlight"
+          ? snapshot.highlights.find((item) => item.id === entry.highlight.id)
+          : undefined;
+      const source = note ?? highlight;
+      if (!source) return;
+      const content = note?.content ?? highlight?.text ?? "";
+      if (!content.trim()) return;
+      if (content.length > MAX_SCRATCHPAD_CHARS) {
+        toast.error("This text is too long for a scratchpad. Nothing was moved.");
+        return;
+      }
+      const file = snapshot.files.find((item) => item.id === source.fileId);
+      const pad = {
+        ...createScratchpad(
+          snapshot.scratchpads,
+          source.fileId
+            ? {
+                id: source.fileId,
+                name: file?.name ?? note?.fileName ?? "Unknown document",
+              }
+            : null,
+        ),
+        content,
+      };
+      const workspace = workspaceIdRef.current;
+      const previousPadId = activePadId;
+      setScratchpads((prev) => [...prev, pad]);
+      if (note) setNotes((prev) => prev.filter((item) => item.id !== note.id));
+      else if (highlight) setHighlights((prev) => prev.filter((item) => item.id !== highlight.id));
+      setActivePadId(pad.id);
+      setNotesTab("rough");
+      markDirty();
+      toast.success("Moved to rough work", {
+        id: "note-moved",
+        action: {
+          label: "Undo",
+          onClick: () => {
+            if (workspaceIdRef.current !== workspace) return;
+            const currentPad = snapshotRef.current.scratchpads.find((item) => item.id === pad.id);
+            const pending =
+              workspace &&
+              journal.list(workspace).find((draft) => draft.fileId === scratchpadDraftId(pad.id));
+            // Keep work edited since the move, including text still in the editor's debounce.
+            if (
+              currentPad?.updatedAt === pad.updatedAt &&
+              currentPad.content === content &&
+              (!pending || pending.text === content)
+            ) {
+              setScratchpads((prev) => prev.filter((item) => item.id !== pad.id));
+              setActivePadId((id) => (id === pad.id ? previousPadId : id));
+              if (workspace) journal.discard(workspace, scratchpadDraftId(pad.id));
+            }
+            if (note)
+              setNotes((prev) =>
+                prev.some((item) => item.id === note.id) ? prev : [...prev, note],
+              );
+            else if (highlight)
+              setHighlights((prev) =>
+                prev.some((item) => item.id === highlight.id) ? prev : [...prev, highlight],
+              );
+            setNotesTab("notes");
+            markDirty();
+          },
+        },
+      });
+    },
+    [activePadId, journal, markDirty, setHighlights],
+  );
 
   const changePad = useCallback(
     (id: string, content: string) => updateScratchpad(id, (pad) => editScratchpad(pad, content)),
@@ -5105,6 +5183,7 @@ flowchart LR
                       onOpenSource={openNoteSource}
                       onUpdate={updateNote}
                       onRemove={removeNote}
+                      onMoveToRoughWork={moveToRoughWork}
                       highlights={highlights}
                       highlightSection={highlightSection}
                       onOpenHighlight={openHighlight}
@@ -5133,6 +5212,7 @@ flowchart LR
                     onOpenSource={openNoteSource}
                     onUpdate={updateNote}
                     onRemove={removeNote}
+                    onMoveToRoughWork={moveToRoughWork}
                     highlights={highlights}
                     highlightSection={highlightSection}
                     onOpenHighlight={openHighlight}

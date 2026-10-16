@@ -263,8 +263,9 @@ test("saving work as a note keeps a copy that links back to its scratchpad", asy
     .poll(async () => (await stored(page)).notes.map((n) => n.content))
     .toEqual(["So $x = 3$ works."]);
 
-  // The note's link opens the pad it came from.
-  await card.getByRole("button", { name: "Rough work › Scratchpad" }).click();
+  // Clicking the note content opens its original pad, without a source heading.
+  await expect(card).not.toContainText("Rough work › Scratchpad");
+  await card.locator(".docs-note").click();
   await expect(page.getByRole("tab", { name: "Rough work" })).toHaveAttribute(
     "aria-selected",
     "true",
