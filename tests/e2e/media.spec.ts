@@ -284,7 +284,6 @@ test("nested folders and cross-workspace Markdown embeds render and bundle their
           pictureFile("blue", blue),
         ],
         bookmarks: [],
-        highlights: [],
         saved: [],
         ui: { activeFileId: "guide", expanded: {}, sidebarCollapsed: false, scrollTop: 0 },
       };

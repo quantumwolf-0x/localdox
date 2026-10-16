@@ -34,7 +34,6 @@ import {
   ContextMenuSubContent,
 } from "@/components/ui/context-menu";
 import { modKeyLabel } from "@/lib/platform/keyboard";
-import type { Highlight } from "@/lib/markdown/dom-highlighter";
 import type { MdFile } from "@/lib/markdown/markdown-utils";
 import { readingMinutes } from "@/lib/markdown/markdown-utils";
 import { fileLabel, getDocumentKind, isEditableKind } from "@/lib/markdown/document-utils";
@@ -168,9 +167,6 @@ interface Props {
   onRenameCurrentWorkspace: (name: string) => void;
   onDeleteCurrentWorkspace: () => void;
   onClearStorage: () => void;
-  highlights: Highlight[];
-  onRemoveHighlight: (id: string) => void;
-  /** Open the isolated "highlights only" view for a file (text-based only). */
   onReorderFile?: (oldIndex: number, newIndex: number) => void;
   /** Move a folder to `targetId`'s place in the list, beside it under the same parent. */
   onReorderFolder?: (folderId: string, targetId: string) => void;
@@ -247,8 +243,6 @@ function SidebarImpl({
   onRenameCurrentWorkspace,
   onDeleteCurrentWorkspace,
   onClearStorage,
-  highlights,
-  onRemoveHighlight,
   onReorderFile,
   onReorderFolder,
   onSortByName,

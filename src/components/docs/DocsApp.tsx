@@ -132,7 +132,14 @@ import type { MdFile, MdChunk } from "@/lib/markdown/markdown-utils";
 // Type only: the writers behind it are a dynamic import at the call site, so
 // the OOXML builder is never on the path to the first paint.
 import type { ExportFormat } from "@/services/markdown-export";
-import type { Highlight } from "@/lib/markdown/dom-highlighter";
+import {
+  addNote as addNoteToSource,
+  changeAnnotation,
+  findAnnotation,
+  removeAnnotation,
+  type Annotation,
+  type AnnotationEvent,
+} from "@/lib/markdown/annotations";
 import {
   isBinExpired,
   WorkspaceConflictError,
@@ -159,7 +166,6 @@ import { clearArtifactResolutionCache } from "@/lib/workspace/workspace-artifact
 import { IMPORT_QUEUE, runBounded } from "@/lib/workspace/import-queue";
 import { toast } from "sonner";
 import { holdReload, registerReloadGuard, reloadConfirmed } from "@/lib/app/safe-reload";
-import { useHistory } from "@/hooks/use-history";
 import {
   isEditableTarget,
   hasModKey,
@@ -190,18 +196,7 @@ import {
   type PassageTarget,
   type SavedItem,
 } from "@/lib/workspace/saved-items";
-import {
-  createNote,
-  editNote,
-  highlightSource,
-  MAX_NOTE_CHARS,
-  resolveNoteSource,
-  sortNotes,
-  type Note,
-  type NoteDraft,
-  type NoteSource,
-  type NotebookEntry,
-} from "@/lib/workspace/notes";
+import { notebookEntries, pageOf, type NotebookEntry } from "@/lib/workspace/notes";
 import {
   createScratchpad,
   duplicateScratchpad,
@@ -211,7 +206,6 @@ import {
   linkScratchpad,
   MAX_SCRATCHPAD_CHARS,
   newScratchpadId,
-  noteFromScratchpad,
   pageAt,
   renameScratchpad,
   scratchpadDraftId,
@@ -254,9 +248,9 @@ import {
 
 type Theme = ThemePref;
 
-// Shared empty, so "this file has no highlights" is always the same array. A
-// fresh `[]` would be a new prop identity on every render.
-const EMPTY_HIGHLIGHTS: Highlight[] = [];
+// Shared empty, so "no notes listed" is always the same array. A fresh `[]`
+// would be a new prop identity on every render.
+const NO_ENTRIES: NotebookEntry[] = [];
 
 /** Whether the Notes panel was open — a per-device convenience, not workspace data. */
 const NOTES_OPEN_KEY = "localdox:notes-open";
@@ -523,14 +517,13 @@ export function DocsApp() {
    * viewer to scroll to.
    */
   const [pendingSaved, setPendingSaved] = useState<PassageTarget | null>(null);
-  // Passages copied out of documents into the Notes panel. Snapshots: edits to
-  // their source never rewrite them (see lib/workspace/notes.ts).
-  const [notes, setNotes] = useState<Note[]>([]);
+  // Notes and highlights are not app state: they are kept in each document's
+  // Markdown (lib/markdown/annotations.ts) and read out for the panel.
   const [notesOpen, setNotesOpen] = useState(false);
   const notesOpenRef = useRef(notesOpen);
   notesOpenRef.current = notesOpen;
-  /** The note just copied, marked in the panel for a moment. */
-  const [freshNoteId, setFreshNoteId] = useState<string | null>(null);
+  /** The note just written, by where its fence starts; marked in the panel for a moment. */
+  const [freshNote, setFreshNote] = useState<{ fileId: string; at: number } | null>(null);
   const [notesTab, setNotesTab] = useState<NotesTab>("notes");
   // Rough work: the reader's scratchpads. Working space that never becomes part
   // of a document unless the reader inserts it (see lib/workspace/rough-work.ts).
@@ -539,20 +532,6 @@ export function DocsApp() {
   // Whether the scratchpad field holds text it hasn't handed over yet. Like
   // `editorDirtyRef`, it is journalled, and holds off adopting another tab's write.
   const roughDirtyRef = useRef(false);
-  // Highlights are the one reader action with no other way back — a mis-drag
-  // silently replaces whatever it overlaps — so they get an undo stack.
-  // `resetHighlights` loads a workspace without making the previous one's
-  // highlights reachable by pressing undo.
-  const {
-    state: highlights,
-    set: setHighlights,
-    amend: amendHighlights,
-    reset: resetHighlights,
-    undo: undoHighlights,
-    redo: redoHighlights,
-    canUndo: canUndoHighlights,
-    canRedo: canRedoHighlights,
-  } = useHistory<Highlight[]>([]);
   // File whose highlights are shown in isolation via the "Show highlights only"
   // menu item; null when the modal is closed.
   // Files arriving from a `#share-files=` link, held until the reader picks
@@ -604,8 +583,6 @@ export function DocsApp() {
     expanded,
     sidebarCollapsed,
     saved,
-    highlights,
-    notes,
     scratchpads,
     recentFileIds,
   });
@@ -617,8 +594,6 @@ export function DocsApp() {
     expanded,
     sidebarCollapsed,
     saved,
-    highlights,
-    notes,
     scratchpads,
     recentFileIds,
   };
@@ -716,8 +691,6 @@ export function DocsApp() {
       // older build reading this workspace keeps its file/section stars.
       bookmarks: toLegacyBookmarks(s.saved),
       saved: s.saved,
-      highlights: s.highlights,
-      notes: s.notes,
       scratchpads: s.scratchpads,
       ui: {
         activeFileId: s.activeFileId,
@@ -926,8 +899,6 @@ export function DocsApp() {
       setExpanded(ws.ui?.expanded ?? {});
       setSidebarCollapsed(!!ws.ui?.sidebarCollapsed);
       setSaved(ws.saved?.length ? ws.saved : migrateBookmarks(ws.bookmarks ?? [], parsed));
-      resetHighlights((ws.highlights ?? []).filter((h) => typeof h.text === "string"));
-      setNotes(ws.notes ?? []);
       setScratchpads(ws.scratchpads ?? []);
       setWorkspaceId(ws.id);
       workspaceIdRef.current = ws.id;
@@ -956,7 +927,7 @@ export function DocsApp() {
         2500,
       );
     },
-    [resetHighlights, persistNow],
+    [persistNow],
   );
   adoptRef.current = (ws) => hydrateWorkspace(ws, { background: true });
 
@@ -1130,7 +1101,6 @@ export function DocsApp() {
     () => ({
       id: workspaceIdRef.current,
       files: snapshotRef.current.files,
-      notes: snapshotRef.current.notes,
       scratchpads: snapshotRef.current.scratchpads,
     }),
     [],
@@ -2294,105 +2264,6 @@ flowchart LR
     [markDirty],
   );
 
-  const addHighlight = useCallback(
-    (hl: Omit<Highlight, "id" | "fileId">, fileId: string) => {
-      setHighlights((prev) => {
-        const overlaps = prev.filter(
-          (p) =>
-            p.fileId === fileId &&
-            p.subtopicId === hl.subtopicId &&
-            typeof p.start === "number" &&
-            typeof p.end === "number" &&
-            typeof hl.start === "number" &&
-            typeof hl.end === "number" &&
-            !(hl.end <= p.start || hl.start >= p.end),
-        );
-        const withoutOverlaps = prev.filter((p) => !overlaps.includes(p));
-        return [
-          ...withoutOverlaps,
-          { id: crypto.randomUUID(), fileId, createdAt: Date.now(), ...hl },
-        ];
-      });
-      markDirty();
-    },
-    [markDirty],
-  );
-
-  const updateHighlight = useCallback(
-    (id: string, patch: Partial<{ color: string; label: string }>) => {
-      setHighlights((prev) => prev.map((h) => (h.id === id ? { ...h, ...patch } : h)));
-      markDirty();
-    },
-    [markDirty],
-  );
-
-  const removeHighlight = useCallback(
-    (id: string) => {
-      setHighlights((prev) => prev.filter((h) => h.id !== id));
-      markDirty();
-    },
-    [markDirty],
-  );
-
-  // The viewer re-anchors highlights whose text moved (the document was edited)
-  // and hands back the corrected offsets. Not an undoable step — the reader
-  // didn't do it — but persisted, so the repair survives a reload.
-  const repairHighlights = useCallback(
-    (patches: Array<{ id: string; patch: Partial<Highlight> }>) => {
-      if (!patches.length) return;
-      const byId = new Map(patches.map((p) => [p.id, p.patch]));
-      amendHighlights((prev) => {
-        let changed = false;
-        const next = prev.map((h) => {
-          const patch = byId.get(h.id);
-          if (!patch) return h;
-          const merged = { ...h, ...patch };
-          if ((Object.keys(patch) as Array<keyof Highlight>).every((k) => h[k] === merged[k])) {
-            return h;
-          }
-          changed = true;
-          return merged;
-        });
-        return changed ? next : prev;
-      });
-      markDirty();
-    },
-    [amendHighlights, markDirty],
-  );
-
-  // Undo/redo for highlights. Cmd on macOS, Ctrl elsewhere; redo accepts both
-  // the Windows form (Ctrl+Y) and the macOS one (Cmd+Shift+Z).
-  //
-  // Two things are deliberately left alone: a focused input or textarea keeps
-  // its native undo (the markdown editor lives in one), and if there is nothing
-  // to undo the event is not consumed, so the browser's own undo still works.
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (!hasModKey(e)) return;
-      if (isEditableTarget(e.target)) return;
-      const key = e.key.toLowerCase();
-
-      const isRedo = key === "y" || (key === "z" && e.shiftKey);
-      const isUndo = key === "z" && !e.shiftKey;
-      if (!isRedo && !isUndo) return;
-
-      if (isRedo) {
-        if (!canRedoHighlights) return;
-        e.preventDefault();
-        redoHighlights();
-        toast("Redid highlight change");
-      } else {
-        if (!canUndoHighlights) return;
-        e.preventDefault();
-        undoHighlights();
-        toast("Undid highlight change");
-      }
-      markDirty();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [canUndoHighlights, canRedoHighlights, undoHighlights, redoHighlights, markDirty]);
-
   const toggleFile = useCallback(
     (fileId: string) => {
       setExpanded((e) => ({ ...e, [fileId]: !(e[fileId] ?? fileId === activeFileId) }));
@@ -2429,84 +2300,26 @@ flowchart LR
   const closeNotes = useCallback(() => setNotesOpen(false), []);
 
   useEffect(() => {
-    if (!freshNoteId) return;
-    const timer = setTimeout(() => setFreshNoteId(null), 2000);
+    if (!freshNote) return;
+    const timer = setTimeout(() => setFreshNote(null), 2000);
     return () => clearTimeout(timer);
-  }, [freshNoteId]);
+  }, [freshNote]);
 
-  const addNote = useCallback(
-    (fileId: string, draft: NoteDraft) => {
-      const file = filesRef.current.find((f) => f.id === fileId);
-      if (!file || !draft.content.trim()) return;
-      const note = createNote(draft, file);
-      setNotes((prev) => [...prev, note]);
-      setFreshNoteId(note.id);
-      markDirty();
-      const truncated = draft.content.length > MAX_NOTE_CHARS;
-      toast.success("Copied to notes", {
-        id: "note-added",
-        description: truncated
-          ? `That selection was very long; the first ${MAX_NOTE_CHARS.toLocaleString()} characters were kept.`
-          : undefined,
-        action: notesOpenRef.current
-          ? undefined
-          : { label: "Show notes", onClick: () => setNotesOpen(true) },
-      });
-    },
-    [markDirty],
-  );
-
-  const updateNote = useCallback(
-    (id: string, content: string) => {
-      setNotes((prev) => prev.map((note) => (note.id === id ? editNote(note, content) : note)));
-      markDirty();
-    },
-    [markDirty],
-  );
-
-  // Deleting is immediate and undoable, rather than confirmed: a note is one
-  // click to make, and a confirmation on every tidy-up teaches readers to
-  // click through confirmations.
-  const removeNote = useCallback(
-    (id: string) => {
-      const note = snapshotRef.current.notes.find((n) => n.id === id);
-      if (!note) return;
-      setNotes((prev) => prev.filter((n) => n.id !== id));
-      markDirty();
-      toast("Note deleted", {
-        id: "note-deleted",
-        action: {
-          label: "Undo",
-          onClick: () => {
-            setNotes((prev) => (prev.some((n) => n.id === id) ? prev : [...prev, note]));
-            markDirty();
-          },
-        },
-      });
-    },
-    [markDirty],
-  );
-
-  // Deleting a highlight from the Notes list is offered back the way a note's
-  // deletion is: the list is far from the passage, so a misclick is unseen.
-  const removeHighlightFromNotes = useCallback(
-    (id: string) => {
-      const highlight = snapshotRef.current.highlights.find((h) => h.id === id);
-      if (!highlight) return;
-      removeHighlight(id);
-      toast("Highlight removed", {
-        id: "note-deleted",
-        action: {
-          label: "Undo",
-          onClick: () => {
-            setHighlights((prev) => (prev.some((h) => h.id === id) ? prev : [...prev, highlight]));
-            markDirty();
-          },
-        },
-      });
-    },
-    [removeHighlight, setHighlights, markDirty],
-  );
+  /**
+   * The viewer wrote a highlight or note into a document. A note is announced,
+   * since it lands somewhere the reader may not be looking: the panel.
+   */
+  const onAnnotated = useCallback((event: AnnotationEvent) => {
+    if (event.kind !== "note") return;
+    setFreshNote({ fileId: event.fileId, at: event.at });
+    toast.success("Copied to notes", {
+      id: "note-added",
+      description: "Saved in the document, after the passage.",
+      action: notesOpenRef.current
+        ? undefined
+        : { label: "Show notes", onClick: () => setNotesOpen(true) },
+    });
+  }, []);
 
   const sortFilesByName = useCallback(() => {
     setFiles((prev) => {
@@ -2586,6 +2399,85 @@ flowchart LR
     [markDirty],
   );
 
+  /**
+   * Change a document from outside its viewer: the Notes panel, rough work.
+   * Text still in an open editor is read first and rewritten in place, so its
+   * next autosave can't put the old text back. Null when nothing changed.
+   */
+  const rewriteDocument = useCallback(
+    (fileId: string, transform: (content: string) => string | null) => {
+      const file = snapshotRef.current.files.find((f) => f.id === fileId);
+      if (!file) return null;
+      const before = readOpenEditor(fileId) ?? file.content;
+      const after = transform(before);
+      if (after === null || after === before) return null;
+      rewriteOpenEditor(fileId, (text) => (text === before ? after : (transform(text) ?? text)));
+      handleContentChange(fileId, after);
+      return { before, after };
+    },
+    [handleContentChange],
+  );
+
+  /**
+   * Rewrite the annotation an entry stands for, found again in the document's
+   * current text (it may have moved since the panel rendered).
+   */
+  const rewriteEntry = useCallback(
+    (entry: NotebookEntry, change: (content: string, annotation: Annotation) => string) => {
+      let missing = false;
+      const result = rewriteDocument(entry.fileId, (content) => {
+        const current = findAnnotation(content, entry);
+        if (!current) missing = true;
+        return current ? change(content, current) : null;
+      });
+      if (missing)
+        toast.error("That note changed in its document. Nothing was changed.", {
+          id: "note-changed",
+        });
+      return result;
+    },
+    [rewriteDocument],
+  );
+
+  /**
+   * Undo for a panel action that took an annotation out: the document as it
+   * was, if nothing else changed since; else the block, put back where it was.
+   */
+  const restoreEntry = useCallback(
+    (entry: NotebookEntry, removed: { before: string; after: string }) => {
+      const block = removed.before.slice(entry.span.start, entry.span.end);
+      rewriteDocument(entry.fileId, (content) => {
+        if (content === removed.after) return removed.before;
+        const at = Math.min(entry.span.start, content.length);
+        const lineStart = at === 0 ? 0 : content.lastIndexOf("\n", at - 1) + 1;
+        return insertIntoDocument(content, block, lineStart).content;
+      });
+    },
+    [rewriteDocument],
+  );
+
+  const updateNote = useCallback(
+    (entry: NotebookEntry, body: string) =>
+      void rewriteEntry(entry, (content, current) => changeAnnotation(content, current, { body })),
+    [rewriteEntry],
+  );
+
+  // Deleting is immediate and undoable, rather than confirmed: a note is one
+  // click to make, and a confirmation on every tidy-up teaches readers to
+  // click through confirmations. The list is far from the passage, so a
+  // misclick would go unseen without the Undo.
+  const removeEntry = useCallback(
+    (entry: NotebookEntry) => {
+      const removed = rewriteEntry(entry, removeAnnotation);
+      if (!removed) return;
+      toast(entry.kind === "note" ? "Note deleted" : "Highlight removed", {
+        id: "note-deleted",
+        action: { label: "Undo", onClick: () => restoreEntry(entry, removed) },
+      });
+    },
+    [rewriteEntry, restoreEntry],
+  );
+
   // ---- rough work ----
 
   // Which tab and which pad were showing: per device, like the panel itself.
@@ -2631,41 +2523,23 @@ flowchart LR
 
   const moveToRoughWork = useCallback(
     (entry: NotebookEntry) => {
-      const snapshot = snapshotRef.current;
-      const note =
-        entry.kind === "note"
-          ? snapshot.notes.find((item) => item.id === entry.note.id)
-          : undefined;
-      const highlight =
-        entry.kind === "highlight"
-          ? snapshot.highlights.find((item) => item.id === entry.highlight.id)
-          : undefined;
-      const source = note ?? highlight;
-      if (!source) return;
-      const content = note?.content ?? highlight?.text ?? "";
+      const content = entry.body;
       if (!content.trim()) return;
       if (content.length > MAX_SCRATCHPAD_CHARS) {
         toast.error("This text is too long for a scratchpad. Nothing was moved.");
         return;
       }
-      const file = snapshot.files.find((item) => item.id === source.fileId);
+      const snapshot = snapshotRef.current;
+      const file = snapshot.files.find((item) => item.id === entry.fileId);
+      const removed = rewriteEntry(entry, removeAnnotation);
+      if (!removed) return;
       const pad = {
-        ...createScratchpad(
-          snapshot.scratchpads,
-          source.fileId
-            ? {
-                id: source.fileId,
-                name: file?.name ?? note?.fileName ?? "Unknown document",
-              }
-            : null,
-        ),
+        ...createScratchpad(snapshot.scratchpads, file ? { id: file.id, name: file.name } : null),
         content,
       };
       const workspace = workspaceIdRef.current;
       const previousPadId = activePadId;
       setScratchpads((prev) => [...prev, pad]);
-      if (note) setNotes((prev) => prev.filter((item) => item.id !== note.id));
-      else if (highlight) setHighlights((prev) => prev.filter((item) => item.id !== highlight.id));
       setActivePadId(pad.id);
       setNotesTab("rough");
       markDirty();
@@ -2689,21 +2563,14 @@ flowchart LR
               setActivePadId((id) => (id === pad.id ? previousPadId : id));
               if (workspace) journal.discard(workspace, scratchpadDraftId(pad.id));
             }
-            if (note)
-              setNotes((prev) =>
-                prev.some((item) => item.id === note.id) ? prev : [...prev, note],
-              );
-            else if (highlight)
-              setHighlights((prev) =>
-                prev.some((item) => item.id === highlight.id) ? prev : [...prev, highlight],
-              );
+            restoreEntry(entry, removed);
             setNotesTab("notes");
             markDirty();
           },
         },
       });
     },
-    [activePadId, journal, markDirty, setHighlights],
+    [activePadId, journal, markDirty, rewriteEntry, restoreEntry],
   );
 
   const changePad = useCallback(
@@ -2792,21 +2659,46 @@ flowchart LR
     [journal, markDirty],
   );
 
+  /**
+   * A note made from rough work goes into the pad's document, at its end; a
+   * pad with no (live) document saves into the workspace's Notes.md, which is
+   * created on first use. Either way it is a copy: the pad stays as it is.
+   */
   const savePadAsNote = useCallback(
     (id: string, markdown: string) => {
-      const pad = snapshotRef.current.scratchpads.find((p) => p.id === id);
+      const snapshot = snapshotRef.current;
+      const pad = snapshot.scratchpads.find((p) => p.id === id);
       if (!pad || !markdown.trim()) return;
-      const note = noteFromScratchpad(pad, markdown.slice(0, MAX_NOTE_CHARS));
-      setNotes((prev) => [...prev, note]);
-      setFreshNoteId(note.id);
-      markDirty();
+      const live = (fileId: string | null) =>
+        snapshot.files.find((f) => f.id === fileId && f.deletedAt == null);
+      const target =
+        live(pad.fileId) ??
+        snapshot.files.find((f) => f.deletedAt == null && f.name.toLowerCase() === "notes.md");
+      // Set inside the rewrite callback, which flow analysis doesn't follow.
+      let saved = null as { fileId: string; name: string; at: number } | null;
+      if (target) {
+        rewriteDocument(target.id, (content) => {
+          const placed = addNoteToSource(content, null, markdown);
+          if (placed) saved = { fileId: target.id, name: target.name, at: placed.at };
+          return placed?.content ?? null;
+        });
+      } else {
+        const placed = addNoteToSource("", null, markdown);
+        if (placed) {
+          const created = addTextFile("Notes.md", placed.content, null);
+          saved = { fileId: created.id, name: created.name, at: placed.at };
+        }
+      }
+      if (!saved) return;
+      const { fileId, name, at } = saved;
+      setFreshNote({ fileId, at });
       toast.success("Saved to notes", {
         id: "note-added",
-        description: "A copy: changing the scratchpad later won't change the note.",
+        description: `Added to the end of ${name}. A copy: changing the scratchpad later won't change it.`,
         action: { label: "Show notes", onClick: () => setNotesTab("notes") },
       });
     },
-    [markDirty],
+    [rewriteDocument, addTextFile],
   );
 
   /**
@@ -3371,7 +3263,6 @@ flowchart LR
       setFiles([]);
       setFolders([]);
       setSaved([]);
-      setNotes([]);
       setScratchpads([]);
       setSaveStatus("idle");
     } finally {
@@ -3411,12 +3302,12 @@ flowchart LR
   const pendingMoveSummary = useMemo(() => {
     if (!pendingMove) return { files: 0, folders: 0 };
     const plan = planTransfer(
-      { files: filesRef.current, folders, saved, highlights },
+      { files: filesRef.current, folders, saved },
       { files: [], folders: [] },
       pendingMove,
     );
     return { files: plan.files.length, folders: plan.folders.length };
-  }, [pendingMove, folders, saved, highlights]);
+  }, [pendingMove, folders, saved]);
 
   /**
    * Move documents and folders into another workspace.
@@ -3482,8 +3373,6 @@ flowchart LR
         setFiles((prev) => prev.filter((file) => !plan.removeFileIds.has(file.id)));
         setFolders((prev) => prev.filter((folder) => !plan.removeFolderIds.has(folder.id)));
         setSaved((prev) => prev.filter((item) => !plan.removeFileIds.has(item.fileId)));
-        setHighlights((prev) => prev.filter((item) => !plan.removeFileIds.has(item.fileId)));
-        setNotes((prev) => prev.filter((item) => !plan.removeFileIds.has(item.fileId)));
         setScratchpads((prev) =>
           prev.filter((pad) => pad.fileId === null || !plan.removeFileIds.has(pad.fileId)),
         );
@@ -3513,7 +3402,7 @@ flowchart LR
         setPendingMove(null);
       }
     },
-    [pendingMove, buildRecord, enterConflict, refreshWorkspaceList, setHighlights],
+    [pendingMove, buildRecord, enterConflict, refreshWorkspaceList],
   );
 
   const openEmbeddedArtifact = useCallback(
@@ -3939,25 +3828,6 @@ flowchart LR
   // changed — which made memoizing it pointless and re-ran its highlight
   // painting and plugin work each time.
 
-  const activeFileHighlights = useMemo(
-    () => (activeFile ? highlights.filter((h) => h.fileId === activeFile.id) : EMPTY_HIGHLIGHTS),
-    [highlights, activeFile],
-  );
-
-  const addHighlightToActive = useCallback(
-    (hl: Omit<Highlight, "id" | "fileId">) => {
-      if (activeFile) addHighlight(hl, activeFile.id);
-    },
-    [addHighlight, activeFile],
-  );
-
-  const copyToNotesFromActive = useCallback(
-    (draft: NoteDraft) => {
-      if (activeFile) addNote(activeFile.id, draft);
-    },
-    [addNote, activeFile],
-  );
-
   const shareActiveFile = useCallback(() => {
     if (activeFile) shareFile(activeFile.id);
   }, [shareFile, activeFile]);
@@ -4032,90 +3902,33 @@ flowchart LR
   }, [activeFile, activeHeadingId]);
 
   /**
-   * Open a passage the reader kept — a note's source, or a highlight — and
-   * flash it. Resolved against the document's Markdown first (see
-   * `resolveNoteSource`), so the right page opens even if the passage has
-   * moved, and a passage or document that is gone says so instead of opening
-   * somewhere unrelated.
+   * Open the document on a note, or on the passage a highlight marks, and
+   * flash it. Found again in the document's current text first, so the right
+   * page opens even if text was added above it since the panel rendered.
    */
-  const openPassage = useCallback(
-    async (fileId: string, source: NoteSource, fallbackName: string) => {
-      const file = filesRef.current.find((f) => f.id === fileId);
-      const status = resolveNoteSource({ source }, file);
-      const name = file?.name ?? fallbackName;
-      if (status.kind === "missing-document") {
-        toast.info("The source document is no longer in this workspace.", {
-          id: "note-source",
-          description: "The note keeps its own copy of the passage.",
-        });
-        return;
-      }
-      if (status.kind === "binned") {
-        toast.info(`“${name}” is in the Bin.`, {
-          id: "note-source",
-          description: "Restore it from Settings ▸ Storage to follow this link.",
-        });
-        return;
-      }
-      // On a phone the sheet covers the very passage being opened.
-      if (mobileNavigation) setNotesOpen(false);
-      const target = status.kind === "found" ? status.subtopicId : (status.target ?? undefined);
-      if (showSettings) await openFromHome(fileId, target);
-      else handleSelect(fileId, target);
-      if (status.kind === "missing-passage") {
+  const openEntry = useCallback(
+    async (entry: NotebookEntry) => {
+      const file = filesRef.current.find((f) => f.id === entry.fileId);
+      if (!file) return;
+      const current = findAnnotation(file.content, entry) ?? entry;
+      if (current.kind === "highlight" && !current.target)
         toast.info("This passage is no longer in the document.", {
           id: "note-source",
-          description: target ? "Opened the section it came from." : undefined,
+          description: "Its highlight is shown as a card where the passage was.",
         });
-        return;
-      }
-      // Stored offsets are only a hint, and only in the space they were
-      // measured in: the page they came from, or the whole document.
-      const sameSpace =
-        !status.moved &&
-        (source.subtopicId === undefined) === (readingModeRef.current === "single");
-      setPendingSaved({
-        fileId,
-        text: source.quote,
-        prefix: source.prefix,
-        suffix: source.suffix,
-        start: sameSpace ? source.start : undefined,
-        // The exact file span, when the note's source anchor still holds.
-        span: status.span,
-      });
+      // A highlight lands on its passage; a note (or a lost highlight's card) on its text.
+      const span = current.target ?? current.bodySpan;
+      // On a phone the sheet covers the very passage being opened.
+      if (mobileNavigation) setNotesOpen(false);
+      const page = pageOf(file, span.start)?.id;
+      if (showSettings) await openFromHome(file.id, page);
+      else handleSelect(file.id, page);
+      setPendingSaved({ fileId: file.id, span });
     },
     [mobileNavigation, showSettings, openFromHome, handleSelect],
   );
 
-  /** A note's source link: its passage, or the scratchpad it was saved from. */
-  const openNoteSource = useCallback(
-    (note: Note) => {
-      // A note saved from rough work links to its scratchpad, not a passage.
-      if (note.origin) {
-        const padId = note.origin.scratchpadId;
-        if (!snapshotRef.current.scratchpads.some((pad) => pad.id === padId)) {
-          toast.info("That scratchpad was deleted.", {
-            id: "note-source",
-            description: "The note keeps its own copy of the work.",
-          });
-          return;
-        }
-        setActivePadId(padId);
-        setNotesTab("rough");
-        return;
-      }
-      void openPassage(note.fileId, note.source, note.fileName);
-    },
-    [openPassage],
-  );
-
-  /** A highlight in the Notes list: open the document on the mark itself. */
-  const openHighlight = useCallback(
-    (highlight: Highlight) => void openPassage(highlight.fileId, highlightSource(highlight), ""),
-    [openPassage],
-  );
-
-  // What the panel shows about each note's source, by file id.
+  // What the panel shows about each entry's document, by file id.
   const filesById = useMemo(() => new Map(files.map((file) => [file.id, file])), [files]);
   const noteFileName = useCallback((fileId: string) => filesById.get(fileId)?.name, [filesById]);
   const noteSourceState = useCallback(
@@ -4125,18 +3938,30 @@ flowchart LR
     },
     [filesById],
   );
-  // A highlight's page, for its line in the Notes list. Not the preamble's:
-  // that page is titled with the document's own name, already shown.
-  const highlightSection = useCallback(
-    (highlight: Highlight) => {
-      const file = filesById.get(highlight.fileId);
-      if (!file || !highlight.subtopicId || highlight.subtopicId === "preamble") return undefined;
-      return fileSubtopics(file).find((chunk) => chunk.id === highlight.subtopicId)?.title;
+  // An entry's page, for its line in the Notes list. Not the preamble's: that
+  // page is titled with the document's own name, already shown.
+  const entrySection = useCallback(
+    (entry: NotebookEntry) => {
+      const file = filesById.get(entry.fileId);
+      const page = file && pageOf(file, (entry.target ?? entry.span).start);
+      return page && page.id !== "preamble" ? page.title : undefined;
     },
     [filesById],
   );
-  const sortedNotes = useMemo(() => sortNotes(notes), [notes]);
-  const writing = useMemo(() => ({ notes, scratchpads }), [notes, scratchpads]);
+  // Read out of the documents only while the panel is open to show them.
+  const entries = useMemo(
+    () => (notesOpen ? notebookEntries(files) : NO_ENTRIES),
+    [files, notesOpen],
+  );
+  const freshEntryId = useMemo(
+    () =>
+      freshNote
+        ? (entries.find((e) => e.fileId === freshNote.fileId && e.span.start === freshNote.at)
+            ?.id ?? null)
+        : null,
+    [entries, freshNote],
+  );
+  const writing = useMemo(() => ({ scratchpads }), [scratchpads]);
 
   const readerFileForPads = useMemo(
     () =>
@@ -4895,8 +4720,6 @@ flowchart LR
                       workspaceIdRef.current && void deleteWorkspace(workspaceIdRef.current)
                     }
                     onClearStorage={clearAllStorage}
-                    highlights={highlights}
-                    onRemoveHighlight={removeHighlight}
                     onOpenSettings={openSettings}
                     onAddToSplit={openBeside}
                     splitFileIds={splitFileIds}
@@ -5090,8 +4913,6 @@ flowchart LR
                         workspaceIdRef.current && void deleteWorkspace(workspaceIdRef.current)
                       }
                       onClearStorage={clearAllStorage}
-                      highlights={highlights}
-                      onRemoveHighlight={removeHighlight}
                       onOpenSettings={(tab) => {
                         setDrawerOpen(false);
                         openSettings(tab);
@@ -5221,7 +5042,6 @@ flowchart LR
                                         <PaneDocument
                                           file={paneFile}
                                           files={files}
-                                          highlights={highlights}
                                           workspaceFolders={folders}
                                           onImportAttachments={importAttachments}
                                           workspaceId={workspaceId}
@@ -5235,10 +5055,6 @@ flowchart LR
                                             syncEditorDirty();
                                           }}
                                           onRenameFile={renameFile}
-                                          onAddHighlight={addHighlight}
-                                          onUpdateHighlight={updateHighlight}
-                                          onRemoveHighlight={removeHighlight}
-                                          onRepairHighlights={repairHighlights}
                                           onOpenArtifact={openEmbeddedArtifact}
                                           readingMode={readingMode}
                                           contentWidth={contentWidth}
@@ -5280,7 +5096,7 @@ flowchart LR
                                               : null
                                           }
                                           onSavedShown={clearPendingSaved}
-                                          onCopyToNotes={addNote}
+                                          onAnnotated={onAnnotated}
                                           onToggleNotes={toggleNotes}
                                           notesOpen={notesOpen}
                                         />
@@ -5313,11 +5129,6 @@ flowchart LR
                           startInEditFileId={autoEditFileId}
                           onStartInEditConsumed={consumeStartInEdit}
                           nextReadingMin={nextReadingMinutes}
-                          highlights={activeFileHighlights}
-                          onAddHighlight={addHighlightToActive}
-                          onUpdateHighlight={updateHighlight}
-                          onRemoveHighlight={removeHighlight}
-                          onRepairHighlights={repairHighlights}
                           pendingSaved={
                             pendingSaved?.fileId === activeFile.id ? pendingSaved : null
                           }
@@ -5330,7 +5141,7 @@ flowchart LR
                           onRenameFile={renameActiveFile}
                           onShareFile={shareActiveFile}
                           onAskAi={aiEnabled ? askAiFromSelection : undefined}
-                          onCopyToNotes={copyToNotesFromActive}
+                          onAnnotated={onAnnotated}
                           onToggleNotes={toggleNotes}
                           notesOpen={notesOpen}
                           readingMode={readingMode}
@@ -5378,19 +5189,15 @@ flowchart LR
                   <LazyBoundary>
                     <NotesPanel
                       variant="docked"
-                      notes={sortedNotes}
+                      entries={entries}
                       fileName={noteFileName}
-                      sourceState={noteSourceState}
-                      onOpenSource={openNoteSource}
+                      entrySection={entrySection}
+                      onOpen={openEntry}
                       onUpdate={updateNote}
-                      onRemove={removeNote}
+                      onRemove={removeEntry}
                       onMoveToRoughWork={moveToRoughWork}
-                      highlights={highlights}
-                      highlightSection={highlightSection}
-                      onOpenHighlight={openHighlight}
-                      onRemoveHighlight={removeHighlightFromNotes}
                       onClose={closeNotes}
-                      freshId={freshNoteId}
+                      freshId={freshEntryId}
                       mathRenderer={mathPreferences.renderer}
                       tab={notesTab}
                       onTabChange={setNotesTab}
@@ -5407,19 +5214,15 @@ flowchart LR
                 <LazyBoundary>
                   <NotesPanel
                     variant="sheet"
-                    notes={sortedNotes}
+                    entries={entries}
                     fileName={noteFileName}
-                    sourceState={noteSourceState}
-                    onOpenSource={openNoteSource}
+                    entrySection={entrySection}
+                    onOpen={openEntry}
                     onUpdate={updateNote}
-                    onRemove={removeNote}
+                    onRemove={removeEntry}
                     onMoveToRoughWork={moveToRoughWork}
-                    highlights={highlights}
-                    highlightSection={highlightSection}
-                    onOpenHighlight={openHighlight}
-                    onRemoveHighlight={removeHighlightFromNotes}
                     onClose={closeNotes}
-                    freshId={freshNoteId}
+                    freshId={freshEntryId}
                     mathRenderer={mathPreferences.renderer}
                     tab={notesTab}
                     onTabChange={setNotesTab}

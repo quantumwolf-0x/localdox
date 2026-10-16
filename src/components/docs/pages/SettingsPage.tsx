@@ -40,9 +40,8 @@ export interface SettingsPageProps {
   onNewWorkspace: (name: string) => void;
   onClearStorage: () => void;
   files: MdFile[];
-  /** The open workspace's notes and rough work, for the storage total. */
+  /** The open workspace's rough work, for the storage total. */
   writing?: {
-    notes: readonly { content: string }[];
     scratchpads: readonly { title: string; content: string }[];
   };
   onOpenWorkspace: (id: string) => void;

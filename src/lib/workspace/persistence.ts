@@ -108,9 +108,7 @@ export interface PersistedUI {
   focusedPaneId?: string | null;
 }
 
-import type { Highlight } from "../markdown/dom-highlighter";
 import type { SavedItem } from "./saved-items";
-import type { Note } from "./notes";
 import type { Scratchpad } from "./rough-work";
 
 export interface WorkspaceRecord {
@@ -134,12 +132,6 @@ export interface WorkspaceRecord {
   bookmarks: string[];
   /** Stars on files, sections, blocks and selections. */
   saved?: SavedItem[];
-  highlights?: Highlight[];
-  /**
-   * Passages copied into the Notes panel. Unlike stars and highlights they
-   * are not dropped with their source document: a note is a snapshot.
-   */
-  notes?: Note[];
   /**
    * Rough work: the reader's scratchpads. Working space, never part of a
    * document's text; optionally associated with one (see rough-work.ts).
@@ -207,10 +199,17 @@ export type FileEntry = Omit<PersistedFile, "data">;
 /** A workspace read without binary bodies (`persistence.getWorkspaceEntries`). */
 export type WorkspaceEntries = Omit<WorkspaceRecord, "files"> & { files: FileEntry[] };
 
-/** Ignore the removed workspace type in old snapshots and backups. */
+/**
+ * Ignore removed fields in old snapshots and backups: the workspace type, and
+ * the record-level `highlights` and `notes` arrays. Highlights and notes now
+ * live in each document's Markdown (markdown/annotations.ts); the stored
+ * arrays are discarded, not migrated.
+ */
 function withoutWorkspaceType<T extends object>(record: T): T {
-  const clean = { ...record };
-  delete (clean as T & { kind?: unknown }).kind;
+  const clean = { ...record } as T & { kind?: unknown; highlights?: unknown; notes?: unknown };
+  delete clean.kind;
+  delete clean.highlights;
+  delete clean.notes;
   return clean;
 }
 
@@ -463,7 +462,8 @@ async function readWorkspace(
     const documents = tx.objectStore(FILES).index("workspaceId").getAll(id);
     tx.onabort = () => reject(tx.error ?? new Error("Could not read workspace"));
     tx.oncomplete = () => {
-      const record = metadata.result as StoredWorkspace | undefined;
+      const stored = metadata.result as StoredWorkspace | undefined;
+      const record = stored && withoutWorkspaceType(stored);
       if (!record) {
         resolve(undefined);
         return;
@@ -700,7 +700,7 @@ export const persistence = {
   /**
    * Stored bytes per workspace, from the summary rows. A row written by an
    * older build has no total yet: its files are measured once, one row at a
-   * time through a cursor, with the notes and rough work on its workspace row,
+   * time through a cursor, with the rough work on its workspace row,
    * and the total is written back in the same transaction.
    */
   async storedBytesByWorkspace(): Promise<Map<string, number>> {
@@ -717,7 +717,7 @@ export const persistence = {
       const tx = db.transaction([STORE, FILES, SUMMARIES], "readwrite");
       for (const id of missing) {
         let bytes = 0;
-        // Notes and rough work live on the workspace row itself.
+        // Rough work lives on the workspace row itself.
         const row = tx.objectStore(STORE).get(id);
         row.onsuccess = () => {
           if (row.result) bytes += recordTextBytes(row.result as StoredWorkspace);
@@ -822,8 +822,6 @@ export function newWorkspaceRecord(name: string): WorkspaceRecord {
     folders: [],
     bookmarks: [],
     saved: [],
-    highlights: [],
-    notes: [],
     scratchpads: [],
     ui: emptyUI(),
   };
@@ -1028,7 +1026,7 @@ export { ImportValidationError };
  */
 export const BACKUP_VERSION = 2;
 
-/** A complete, faithful backup — Bin, stars, notes and layout included. */
+/** A complete, faithful backup — Bin, stars, rough work and layout included. */
 export async function serializeWorkspace(w: WorkspaceRecord): Promise<string> {
   const { revision: _revision, ...workspace } = withoutWorkspaceType(w);
   return JSON.stringify(
@@ -1097,8 +1095,6 @@ export function parseWorkspaceImport(json: string): WorkspaceRecord {
     })),
     bookmarks: w.bookmarks,
     ...(w.saved ? { saved: w.saved } : {}),
-    highlights: w.highlights,
-    notes: w.notes,
     scratchpads: w.scratchpads,
     ui: {
       activeFileId: w.ui.activeFileId,
