@@ -22,6 +22,7 @@ import { markdownComponents } from "./markdown-viewer/markdown-components";
 import { useSectionFolds } from "./markdown-viewer/section-folds";
 import { MarkdownViewModes, type MarkdownViewMode } from "./markdown-viewer/MarkdownViewModes";
 import { MarkdownOutline } from "./markdown-viewer/MarkdownOutline";
+import { NoteConnections } from "./markdown-viewer/NoteConnections";
 import { MathProvider } from "@/services/math/MathContext";
 import { DEFAULT_MATH_PREFERENCES } from "@/services/math/types";
 import { slugLabel } from "@/services/math/equation-registry";
@@ -331,8 +332,8 @@ function MarkdownViewerImpl({
     [file, singleMode, onNav],
   );
   const cancelEdit = useCallback(
-    (cursorIndex?: number) => {
-      onContentChange(file.id, originalContentRef.current);
+    (cursorIndex?: number, content?: string) => {
+      onContentChange(file.id, content ?? originalContentRef.current);
       setEditMode(false);
       if (cursorIndex !== undefined) {
         const chunks = fileSubtopics(file);
@@ -1815,6 +1816,7 @@ function MarkdownViewerImpl({
                   sourceFile: file,
                 }}
                 onImportAttachments={onImportAttachments}
+                mathPreferences={mathPreferences}
               />
             ) : (
               <div
@@ -1873,6 +1875,7 @@ function MarkdownViewerImpl({
                 }}
               />
             )}
+            {!editMode && viewMode !== "tree" && <div className="not-prose"><NoteConnections fileId={file.id} /></div>}
           </article>
         </div>
 

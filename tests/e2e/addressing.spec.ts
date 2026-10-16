@@ -188,7 +188,8 @@ test("a note's link lands on its own occurrence, even after the document is edit
   await expect(page.getByText("A new opening paragraph, added later.")).toBeVisible();
 
   await page.evaluate(() => (CSS as unknown as Registry).highlights.delete("dc-saved-flash"));
-  await panel.getByRole("button", { name: /^guide\.md/ }).click();
+  await panel.getByRole("button", { name: "Go to this passage in guide.md", exact: true }).focus();
+  await page.keyboard.press("Enter");
   expect(await flashed(page)).toEqual({
     text: sentence,
     cell: null,

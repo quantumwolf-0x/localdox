@@ -341,10 +341,11 @@ test("nested folders and cross-workspace Markdown embeds render and bundle their
     },
     { blue, red },
   );
-  await page.reload();
+  await page.goto("/workspaces/media-current/files/guide");
   await expect(page.getByRole("img", { name: "Local", exact: true })).toBeVisible();
   await expect(page.getByRole("img", { name: "Other", exact: true })).toBeVisible();
   await expect(page.getByRole("img", { name: "Nested red", exact: true })).toBeVisible();
+  await page.locator('aside [data-sidebar-folder="docs"]').locator(":scope > button").click();
   const result = await download(page);
   const zip = await JSZip.loadAsync(result.bytes);
   const images = Object.keys(zip.files).filter((name) => name.endsWith("photo.svg"));

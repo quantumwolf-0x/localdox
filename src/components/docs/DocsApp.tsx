@@ -86,7 +86,10 @@ import {
   type NotesTab,
   type RoughWorkProps,
 } from "./notes/NotesPanelLazy";
-import { isEditorOpen } from "./editor/open-editors";
+import { isEditorOpen, readOpenEditor, rewriteOpenEditor } from "./editor/open-editors";
+import { WorkspaceLinksContext } from "./workspace/WorkspaceLinksContext";
+import { NoteLinkIndex, resolveNoteLink, rewriteNoteLinks, splitNoteReference, noteTargetSpan } from "@/lib/markdown/note-links";
+import { folderPath, normalizePath } from "@/lib/markdown/media-references";
 import { BottomSheet } from "@/components/ui/bottom-sheet";
 import { EditFileContext } from "./viewer/EditFileContext";
 import type { AskAiPrefill } from "@/services/ai";
@@ -309,6 +312,8 @@ export function DocsApp() {
   // which one it sits in, so folders can appear and disappear without touching
   // the documents themselves.
   const [folders, setFolders] = useState<FolderRecord[]>([]);
+  const noteIndex = useRef(new NoteLinkIndex());
+  const noteLinks = useMemo(() => noteIndex.current.update(files, folders), [files, folders]);
   /**
    * The split layout. Panes own their tabs; the app's single "active file" is
    * derived from whichever pane has focus.
@@ -1475,7 +1480,7 @@ export function DocsApp() {
       occurrence?: number,
       lineIndex?: number,
     ) => {
-      if (!confirmDiscardDraft(fileId)) return;
+      if (!confirmDiscardDraft(fileId)) return false;
       setActiveFileId(fileId);
       if (query !== undefined) setHighlightQuery(query || null);
       // A search hit knows the line it matched, so the viewer can scroll to the
@@ -1512,6 +1517,7 @@ export function DocsApp() {
         headingId: targetHeadingId,
         query: query !== undefined ? query || null : highlightQueryRef.current,
       });
+      return true;
     },
     [navigate, markDirty],
   );
@@ -1882,16 +1888,36 @@ export function DocsApp() {
     }
   }, []);
 
+  const updateLinkedWorkspace = useCallback((changeFiles: (files: MdFile[]) => MdFile[], changeFolders: (folders: FolderRecord[]) => FolderRecord[] = (value) => value) => {
+    const snapshot = snapshotRef.current;
+    // Include unsent keystrokes before rewriting; an open editor must never
+    // autosave its old links over a rename or lose text to an external update.
+    const before = snapshot.files.map((file) => {
+      const content = readOpenEditor(file.id);
+      return content === undefined || content === file.content ? file : { ...file, content };
+    });
+    const nextFolders = changeFolders(snapshot.folders);
+    const after = changeFiles(before);
+    const nextFiles = rewriteNoteLinks(before, after, snapshot.folders, nextFolders);
+    for (const file of before) rewriteOpenEditor(file.id, (content) => rewriteNoteLinks(before, after.map((item) => item.id === file.id ? { ...item, content } : item), snapshot.folders, nextFolders).find((item) => item.id === file.id)?.content ?? content);
+    setFiles(nextFiles);
+    setFolders(nextFolders);
+    markDirty();
+  }, [markDirty]);
+
   const renameFile = useCallback(
     (id: string, newName: string) => {
-      setFiles((prev) =>
+      newName = newName.trim();
+      if (!newName || /[\/\\\n\r]/.test(newName)) { toast.error("Use a file name without slashes."); return; }
+      const current = snapshotRef.current.files.find((file) => file.id === id);
+      if (snapshotRef.current.files.some((file) => file.id !== id && !file.deletedAt && file.folderId === current?.folderId && file.name.toLowerCase() === newName.toLowerCase())) { toast.error("A file with this name already exists in this folder."); return; }
+      updateLinkedWorkspace((prev) =>
         prev.map((f) =>
           f.id === id ? { ...f, name: newName, kind: getDocumentKind(newName, f.mimeType) } : f,
         ),
       );
-      markDirty();
     },
-    [markDirty],
+    [updateLinkedWorkspace],
   );
 
   /**
@@ -2179,7 +2205,7 @@ flowchart LR
   const moveFolderToFolder = useCallback(
     (folderId: string, parentId: string | null) => {
       if (folderId === parentId) return;
-      setFolders((prev) => {
+      updateLinkedWorkspace((value) => value, (prev) => {
         if (parentId) {
           const parentOf = new Map(prev.map((f) => [f.id, f.parentId ?? null]));
           for (let at: string | null = parentId; at; at = parentOf.get(at) ?? null) {
@@ -2188,19 +2214,20 @@ flowchart LR
         }
         return prev.map((f) => (f.id === folderId ? { ...f, parentId } : f));
       });
-      markDirty();
     },
-    [markDirty],
+    [updateLinkedWorkspace],
   );
 
   const renameFolder = useCallback(
     (id: string, name: string) => {
       const trimmed = name.trim();
       if (!trimmed) return;
-      setFolders((prev) => prev.map((f) => (f.id === id ? { ...f, name: trimmed } : f)));
-      markDirty();
+      if (/[\/\\\n\r]/.test(trimmed)) { toast.error("Use a folder name without slashes."); return; }
+      const current = snapshotRef.current.folders.find((folder) => folder.id === id);
+      if (snapshotRef.current.folders.some((folder) => folder.id !== id && (folder.parentId ?? null) === (current?.parentId ?? null) && folder.name.toLowerCase() === trimmed.toLowerCase())) { toast.error("A folder with this name already exists here."); return; }
+      updateLinkedWorkspace((value) => value, (prev) => prev.map((f) => (f.id === id ? { ...f, name: trimmed } : f)));
     },
-    [markDirty],
+    [updateLinkedWorkspace],
   );
 
   /**
@@ -2212,23 +2239,20 @@ flowchart LR
    */
   const deleteFolder = useCallback(
     (id: string) => {
-      setFolders((prev) =>
+      updateLinkedWorkspace((prev) => prev.map((f) => (f.folderId === id ? { ...f, folderId: null } : f)), (prev) =>
         prev
           .filter((f) => f.id !== id)
           .map((f) => (f.parentId === id ? { ...f, parentId: null } : f)),
       );
-      setFiles((prev) => prev.map((f) => (f.folderId === id ? { ...f, folderId: null } : f)));
-      markDirty();
     },
-    [markDirty],
+    [updateLinkedWorkspace],
   );
 
   const moveFileToFolder = useCallback(
     (fileId: string, folderId: string | null) => {
-      setFiles((prev) => prev.map((f) => (f.id === fileId ? { ...f, folderId } : f)));
-      markDirty();
+      updateLinkedWorkspace((prev) => prev.map((f) => (f.id === fileId ? { ...f, folderId } : f)));
     },
-    [markDirty],
+    [updateLinkedWorkspace],
   );
 
   /**
@@ -2239,7 +2263,7 @@ flowchart LR
   const reorderFolder = useCallback(
     (folderId: string, targetId: string) => {
       if (folderId === targetId) return;
-      setFolders((prev) => {
+      updateLinkedWorkspace((value) => value, (prev) => {
         const from = prev.findIndex((f) => f.id === folderId);
         const to = prev.findIndex((f) => f.id === targetId);
         if (from === -1 || to === -1) return prev;
@@ -2253,9 +2277,8 @@ flowchart LR
         next.splice(to, 0, { ...moved, parentId });
         return next;
       });
-      markDirty();
     },
-    [markDirty],
+    [updateLinkedWorkspace],
   );
 
   const reorderFile = useCallback(
@@ -4679,6 +4702,62 @@ flowchart LR
     ],
   );
 
+  const followNoteReference = useCallback((reference: string, sourceId: string, chosenId?: string) => {
+    const current = snapshotRef.current;
+    const source = current.files.find((file) => file.id === sourceId);
+    if (!source) return;
+    const result = resolveNoteLink(reference, source, current.files, current.folders);
+    const chosen = chosenId ? current.files.find((file) => file.id === chosenId && !file.deletedAt) : undefined;
+    const target = chosen ?? (result.status === "found" ? result.file : undefined);
+    if (target) {
+      const fragment = splitNoteReference(reference).fragment;
+      const span = noteTargetSpan(target.content, fragment);
+      if (fragment && !span) { toast.error(`Couldn't find ${fragment} in ${target.name}.`); return; }
+      let heading: string | undefined;
+      if (span) {
+        let offset = 0;
+        for (const chunk of fileSubtopics(target)) {
+          const start = target.content.indexOf(chunk.content, offset);
+          if (start < 0) continue;
+          if (start <= span.start) heading = chunk.id;
+          offset = start + chunk.content.length;
+        }
+      }
+      if (!handleSelect(target.id, heading)) return;
+      if (span) setPendingSaved({ fileId: target.id, span, text: target.content.slice(span.start, span.end) });
+      return;
+    }
+    if (result.status === "ambiguous") { toast.error("Several notes match. Use a folder path or choose a note from the link."); return; }
+    const { name } = splitNoteReference(reference);
+    if (!name || name.startsWith("@") || /[\\\n\r:*?"<>|]/.test(name)) { toast.error("Use a note name or a folder/note path."); return; }
+    const path = normalizePath(name.startsWith("/") || (name.includes("/") && !/^\.\.?\//.test(name)) ? name : `${folderPath(source.folderId, current.folders)}/${name}`);
+    if (!path) { toast.error("This note path is outside the workspace."); return; }
+    const parts = path.split("/");
+    const requested = parts.pop()!;
+    if (/\.[a-z\d]+$/i.test(requested) && !/\.(md|markdown|mdx|txt)$/i.test(requested)) { toast.error("Upload the referenced attachment to open it."); return; }
+    if (!confirmDiscardDraft("new-note")) return;
+    const nextFolders = [...current.folders];
+    let parentId: string | null = null;
+    for (const part of parts) {
+      let folder = nextFolders.find((item) => (item.parentId ?? null) === parentId && item.name.toLowerCase() === part.toLowerCase());
+      if (!folder) { folder = { id: crypto.randomUUID(), name: part, parentId, createdAt: Date.now() }; nextFolders.push(folder); }
+      parentId = folder.id;
+    }
+    const fileName = /\.(md|markdown|mdx|txt)$/i.test(requested) ? requested : `${requested}.md`;
+    const id = crypto.randomUUID();
+    const file: MdFile = { id, name: fileName, content: "", kind: "markdown", folderId: parentId, mimeType: "text/markdown", addedAt: Date.now(), headings: [] };
+    setFolders(nextFolders);
+    setFiles((prev) => [...prev, file]);
+    setActiveFileId(id);
+    setActiveHeadingId(null);
+    preloadMarkdownViewer();
+    preloadMarkdownEditor();
+    setAutoEditFileId(id);
+    setDrawerOpen(false);
+    markDirty();
+  }, [handleSelect, markDirty]);
+  const workspaceLinks = useMemo(() => ({ files, folders, links: noteLinks, follow: followNoteReference }), [files, folders, noteLinks, followNoteReference]);
+
   const routeNotice = routeError && (
     <div
       role="alert"
@@ -4732,6 +4811,7 @@ flowchart LR
 
   return (
     <NavHistoryContext.Provider value={navHistory}>
+      <WorkspaceLinksContext.Provider value={workspaceLinks}>
       {routeNotice}
       <ExamWorkspaceContext.Provider value={examWorkspace}>
         <DraftJournalContext.Provider value={journalContext}>
@@ -5393,6 +5473,7 @@ flowchart LR
           </div>
         </DraftJournalContext.Provider>
       </ExamWorkspaceContext.Provider>
+      </WorkspaceLinksContext.Provider>
     </NavHistoryContext.Provider>
   );
 }

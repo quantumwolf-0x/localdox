@@ -24,6 +24,7 @@ import remarkGfm from "remark-gfm";
 import { remarkTasks } from "./markdown-tasks";
 import remarkMath from "remark-math";
 import rehypeSlug from "rehype-slug";
+import { remarkNoteLinks } from "./remark-note-links";
 import {
   remarkEquationReferences,
   remarkInlineMathRefs,
@@ -78,6 +79,7 @@ function loadHighlight(): Promise<Plugin> {
 // buried inside an already-converted node.
 const BASE_REMARK = [
   remarkGfm,
+  remarkNoteLinks,
   remarkTasks,
   remarkMath,
   remarkInlineMathRefs,
