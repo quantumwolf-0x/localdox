@@ -178,6 +178,70 @@ test("application search preserves the article DOM and saved highlights repaint 
   expect(errors).toEqual([]);
 });
 
+test("math highlights keep the complete quote and survive reopening", async ({ page }) => {
+  await page.addInitScript(() =>
+    localStorage.setItem(
+      "localdox:prefs",
+      JSON.stringify({ name: "Reader", namePrompted: true, aiEnabled: false }),
+    ),
+  );
+  await page.goto("/");
+  await page
+    .locator('input[type="file"]')
+    .first()
+    .setInputFiles({
+      name: "math-highlights.md",
+      mimeType: "text/markdown",
+      buffer: Buffer.from(
+        "# Math highlights\n\nInline $a = b$ alone.\n\nBefore $E = mc^2$ after.\n\n$$\n\\frac{a+b}{c} = x^2\n$$\n",
+      ),
+    });
+  await expect(page.locator("article .katex")).toHaveCount(3);
+  const expected: string[] = [];
+  for (const [selector, label] of [
+    ["article .docs-math-inline", ""],
+    ['article p[data-src]:has-text("Before")', "Passage"],
+    ["article .docs-math-rendered", "Equation"],
+  ]) {
+    const quote = await page
+      .locator(selector)
+      .first()
+      .evaluate((el) => {
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        const sel = getSelection()!;
+        sel.removeAllRanges();
+        sel.addRange(range);
+        const quote = range.toString();
+        el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+        return quote;
+      });
+    expected.push(quote);
+    if (label) {
+      await page.getByPlaceholder("Add a label...").fill(label);
+      await page.getByPlaceholder("Add a label...").press("Enter");
+    } else {
+      await page.getByRole("button", { name: "Highlight #fde047", exact: true }).click();
+    }
+    await expect
+      .poll(() =>
+        page.evaluate(() =>
+          [...((CSS as any).highlights.get("dc-hl-0") ?? [])].map((r: Range) => r.toString()),
+        ),
+      )
+      .toEqual(expected);
+  }
+  await page.reload();
+  await expect(page.locator("article .katex")).toHaveCount(3);
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        [...((CSS as any).highlights.get("dc-hl-0") ?? [])].map((r: Range) => r.toString()),
+      ),
+    )
+    .toEqual(expected);
+});
+
 test("PDF search paints exact matches and changes the active occurrence within one span", async ({
   page,
   context,

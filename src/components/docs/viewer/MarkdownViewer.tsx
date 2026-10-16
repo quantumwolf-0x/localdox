@@ -521,6 +521,8 @@ function MarkdownViewerImpl({
     | {
         mode: "create";
         text: string;
+        /** Quote from the text index, without Selection's layout-added line breaks. */
+        quote: string;
         start: number;
         end: number;
         prefix: string;
@@ -557,6 +559,10 @@ function MarkdownViewerImpl({
     setMenu({
       mode: "create",
       text: sel.text,
+      // Math has a visual layer and an assistive layer. Selection.toString()
+      // omits hidden text and adds layout breaks; anchors must use the same
+      // text index as the offsets, including when saving with a label.
+      quote: textBetween(contentRef.current, sel.start, sel.end),
       start: sel.start,
       end: sel.end,
       prefix: ctx.prefix,
@@ -1485,7 +1491,7 @@ function MarkdownViewerImpl({
                       onClick={() => {
                         if (menu.mode === "create") {
                           onAddHighlight({
-                            text: menu.text,
+                            text: menu.quote,
                             color,
                             label: menu.label.trim() || undefined,
                             subtopicId: singleMode ? undefined : activeChunk.id,
@@ -1656,7 +1662,7 @@ function MarkdownViewerImpl({
                     if (e.key === "Enter") {
                       if (menu.mode === "create") {
                         onAddHighlight({
-                          text: menu.text,
+                          text: menu.quote,
                           color: HL_COLORS[0],
                           label: menu.label.trim() || undefined,
                           subtopicId: singleMode ? undefined : activeChunk.id,
